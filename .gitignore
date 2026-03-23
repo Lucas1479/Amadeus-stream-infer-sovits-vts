@@ -1,0 +1,103 @@
+# =============================================================================
+# amadeus-realtime — .gitignore
+# =============================================================================
+
+# ── 密钥 / 凭证（绝对不能入库） ────────────────────────────────────────────────
+.env
+*.key
+*_API_KEY.txt
+vts_auth_token.json
+
+# ── Python 虚拟环境 ─────────────────────────────────────────────────────────
+.venv/
+.venv_live/
+.venv1/
+venv/
+env/
+ENV/
+
+# ── Python 编译产物 ─────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# ── 模型权重（体积巨大，用 .env 指向本地路径） ───────────────────────────────────
+GPT_weights/
+GPT_weights_v2/
+GPT_weights_v3/
+SoVITS_weights/
+SoVITS_weights_v2/
+SoVITS_weights_v3/
+weight.json
+*.ckpt
+*.pth
+*.gguf
+*.bin
+
+# ── 运行时生成数据 ──────────────────────────────────────────────────────────
+sessions/
+output/
+logs/
+TEMP/
+runtime/
+*.log
+
+# ── RAG 向量数据（本地个人数据，不共享） ─────────────────────────────────────
+kurisu_data.json
+kurisu_index.faiss
+
+# ── 参考音频（大文件，版权敏感） ─────────────────────────────────────────────
+reference audio/
+ref_audios/
+
+# ── 超大预训练文件（超过 GitHub 100MB 限制） ──────────────────────────────────
+tools/AP_BWE_main/24kto48k/*.zip
+tools/AP_BWE_main/24kto48k/*.pth
+tools/AP_BWE_main/24kto48k/*.bin
+
+# ── 二进制可执行（ffmpeg 等） ───────────────────────────────────────────────
+ffmpeg.exe
+ffprobe.exe
+ffmpeg
+ffprobe
+
+# ── IDE / OS ────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ── 构建 / 打包产物 ─────────────────────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+*.egg
+MANIFEST
+wheels/
+
+# ── 测试 / 覆盖率 ──────────────────────────────────────────────────────────
+htmlcov/
+.coverage
+.coverage.*
+.pytest_cache/
+.tox/
+nosetests.xml
+coverage.xml
+
+# ── Jupyter ─────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── 类型检查工具缓存 ────────────────────────────────────────────────────────
+.mypy_cache/
+.pytype/
+.pyre/
+.ruff_cache/
+
+# ── 其他临时文件 ────────────────────────────────────────────────────────────
+*.tmp
+*.bak
+*.swp
+*.swo
+pip-log.txt
