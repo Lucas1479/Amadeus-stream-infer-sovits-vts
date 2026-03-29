@@ -392,7 +392,9 @@ def local_llm_query(question: str) -> str:
             }
             response = requests.post(f"{base_url}/chat/completions", json=payload, timeout=20)
             response.raise_for_status()
-            reply = response.json()["choices"][0]["message"]["content"]
+            raw_reply = response.json()["choices"][0]["message"]["content"]
+            import re as _re
+            reply = _re.sub(r"<think>.*?</think>", "", raw_reply, flags=_re.DOTALL).strip()
 
         else:
             raise ValueError(f"未知的本地LLM类型: {LOCAL_LLM_TYPE}")

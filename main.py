@@ -447,6 +447,36 @@ def clean_sentence_for_tts(sentence: str) -> str:
     s = re.sub(r"\[[^\]]*$", "", s)
     return s.strip()
 
+_think_strip_buf: str = ""
+_think_strip_active: bool = False
+
+def _strip_think_tokens(text: str) -> str:
+    """过滤 Qwen3 思维链残留 token：<think>...</think>（含跨 chunk 情况）"""
+    global _think_strip_buf, _think_strip_active
+    result = []
+    i = 0
+    while i < len(text):
+        if _think_strip_active:
+            end = text.find("</think>", i)
+            if end == -1:
+                _think_strip_buf += text[i:]
+                return "".join(result)
+            else:
+                _think_strip_active = False
+                _think_strip_buf = ""
+                i = end + len("</think>")
+        else:
+            start = text.find("<think>", i)
+            if start == -1:
+                result.append(text[i:])
+                break
+            result.append(text[i:start])
+            _think_strip_active = True
+            _think_strip_buf = "<think>"
+            i = start + len("<think>")
+    return "".join(result)
+
+
 def process_stream_chunk(raw_text: str):
     """
     字符级流式解析:
@@ -458,6 +488,7 @@ def process_stream_chunk(raw_text: str):
     global _st_in_tag, _st_tag_buf
     if not raw_text:
         return "", []
+    raw_text = _strip_think_tokens(raw_text)
     actions = []
     out_chars = []
 
@@ -771,7 +802,7 @@ async def stream_llm_query(question, gui_callback=None):
                 logger.info(f"📊 句子处理耗时: {processing_time:.3f}s (ID: {sentence_id})")
                 
                 # 🚀 性能异常告警
-                if processing_time > 1.0:
+                if processing_time > 8.0:
                     logger.warning(f"⚠️ 句子处理超时: {processing_time:.3f}s (ID: {sentence_id})")
 
         async def append_and_dispatch(text_piece: str):
@@ -974,7 +1005,7 @@ async def stream_llm_query(question, gui_callback=None):
                 try:
                     # 使用异步HTTP客户端进行非阻塞请求
                     async with aiohttp.ClientSession() as session:
-                        async with session.post(api_url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                        async with session.post(api_url, json=payload, timeout=aiohttp.ClientTimeout(total=120, sock_read=60)) as response:
                             response.raise_for_status()
                             
                             # First Sentence Sprint 策略变量
@@ -2022,6 +2053,7 @@ if __name__ == "__main__":
             pending_sentence_items=pending_sentence_items,
             play_queue=play_queue,
             llm_warmup_fn=remote_llm_query,
+            exp_tts_semaphore=exp_tts_semaphore,
         )
 
         # ── 注入 vts/action 运行时依赖 ────────────────────────────────────────

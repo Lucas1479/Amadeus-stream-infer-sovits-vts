@@ -20,6 +20,7 @@ from config.settings import (
     LOCAL_LLM_MODEL,
     LOCAL_LLM_TYPE,
     USE_LOCAL_LLM,
+    LOCAL_LLM_CUDA_VISIBLE_DEVICES,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,9 @@ async def start_llama_server() -> None:
 
     env = os.environ.copy()
     env["PATH"] = server_dir + os.pathsep + env.get("PATH", "")
+    if LOCAL_LLM_CUDA_VISIBLE_DEVICES:
+        env["CUDA_VISIBLE_DEVICES"] = LOCAL_LLM_CUDA_VISIBLE_DEVICES
+        logger.info(f"🎮 llama-server CUDA_VISIBLE_DEVICES = {LOCAL_LLM_CUDA_VISIBLE_DEVICES}")
 
     logger.info(f"🐛 DEBUG: CLI_ARGS = {LOCAL_LLM_CLI_ARGS}")
     logger.info(f"🚀 启动 llama-server: {' '.join(cmd)}")

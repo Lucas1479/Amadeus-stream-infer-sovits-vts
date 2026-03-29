@@ -15,7 +15,8 @@ from qfluentwidgets import (FluentWindow, NavigationItemPosition, SubtitleLabel,
                             OptionsSettingCard, FluentIcon as FIF, InfoBar, InfoBarPosition,
                             setTheme, Theme, ToolButton, TransparentToolButton,
                             LineEdit, Action, RoundMenu, PushSettingCard,
-                            OptionsConfigItem, OptionsValidator, ConfigItem, BoolValidator, setThemeColor)
+                            OptionsConfigItem, OptionsValidator, ConfigItem, BoolValidator,
+                            setThemeColor, ComboBox)
 
 def get_main_module():
     # 直接运行 python main.py 时，主模块注册为 '__main__' 而非 'main'
@@ -196,6 +197,49 @@ class ChatInterface(QWidget):
         self.chat_layout = QVBoxLayout(self.chat_area)
         self.chat_layout.setContentsMargins(20, 20, 20, 20)
         
+        # ── Model Bar ──────────────────────────────────────────────────────────
+        self.model_bar = QFrame(self.chat_area)
+        self.model_bar.setFixedHeight(44)
+        self.model_bar.setStyleSheet(
+            "QFrame { background-color: #F5F5F5; border-bottom: 1px solid #E0E0E0; "
+            "border-radius: 0px; }"
+        )
+        mb_layout = QHBoxLayout(self.model_bar)
+        mb_layout.setContentsMargins(16, 0, 16, 0)
+        mb_layout.setSpacing(16)
+
+        # LLM Provider
+        lbl_provider = QLabel("🤖 Model:", self.model_bar)
+        lbl_provider.setStyleSheet("font-size: 13px; color: #333; background: transparent; border: none;")
+        self.provider_combo = ComboBox(self.model_bar)
+        self.provider_combo.addItems(["deepseek", "gemini", "bedrock", "local"])
+        self.provider_combo.setFixedWidth(120)
+        self.provider_combo.currentTextChanged.connect(self._on_bar_provider_changed)
+
+        # Separator
+        sep = QFrame(self.model_bar)
+        sep.setFrameShape(QFrame.VLine)
+        sep.setStyleSheet("color: #D0D0D0; border: none; background: #D0D0D0;")
+        sep.setFixedWidth(1)
+
+        # TTS Mode
+        lbl_tts = QLabel("🔊 TTS:", self.model_bar)
+        lbl_tts.setStyleSheet("font-size: 13px; color: #333; background: transparent; border: none;")
+        self.tts_mode_combo = ComboBox(self.model_bar)
+        self.tts_mode_combo.addItems(["Parallel ×2", "CUDA Graph ×1"])
+        self.tts_mode_combo.setFixedWidth(150)
+        self.tts_mode_combo.currentTextChanged.connect(self._on_bar_tts_mode_changed)
+
+        mb_layout.addWidget(lbl_provider)
+        mb_layout.addWidget(self.provider_combo)
+        mb_layout.addWidget(sep)
+        mb_layout.addWidget(lbl_tts)
+        mb_layout.addWidget(self.tts_mode_combo)
+        mb_layout.addStretch(1)
+
+        self.chat_layout.addWidget(self.model_bar)
+        # ── End Model Bar ──────────────────────────────────────────────────────
+
         self.scroll_area = ScrollArea(self.chat_area)
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
@@ -216,6 +260,7 @@ class ChatInterface(QWidget):
         self.main_layout.addWidget(self.chat_area, 1)
         
         self.reload_sessions()
+        self._sync_model_bar()
 
     def set_live_api_active(self, active: bool):
         """由 SettingInterface 调用，同步 Live API 状态到输入栏。"""
@@ -229,6 +274,54 @@ class ChatInterface(QWidget):
     def _on_mic_clicked(self):
         if self.asr_callback:
             self.asr_callback()
+
+    def _sync_model_bar(self):
+        """从 main_module / 环境变量同步 model bar 初始状态。"""
+        import os
+        main_module = get_main_module()
+        if main_module:
+            provider = getattr(main_module, 'LLM_PROVIDER', 'deepseek')
+            idx = self.provider_combo.findText(provider)
+            if idx >= 0:
+                self.provider_combo.blockSignals(True)
+                self.provider_combo.setCurrentIndex(idx)
+                self.provider_combo.blockSignals(False)
+        cuda_graph_on = os.environ.get('ENABLE_CUDA_GRAPH', '0') == '1'
+        tts_text = "CUDA Graph ×1" if cuda_graph_on else "Parallel ×2"
+        idx = self.tts_mode_combo.findText(tts_text)
+        if idx >= 0:
+            self.tts_mode_combo.blockSignals(True)
+            self.tts_mode_combo.setCurrentIndex(idx)
+            self.tts_mode_combo.blockSignals(False)
+
+    def _on_bar_provider_changed(self, text):
+        main_module = get_main_module()
+        if main_module:
+            main_module.LLM_PROVIDER = text
+            main_module.USE_LOCAL_LLM = (text == "local")
+        # 同步到 Settings 页
+        main_win = self._get_main_window()
+        if main_win and hasattr(main_win, 'settingInterface'):
+            si = main_win.settingInterface
+            if hasattr(si, 'providerCard'):
+                si.providerCard.setValue(text)
+
+    def _on_bar_tts_mode_changed(self, text):
+        try:
+            import tts.pipeline as _tts_pipeline
+            if text == "CUDA Graph ×1":
+                _tts_pipeline.reconfigure_tts_mode(cuda_graph=True, concurrency=1)
+            else:
+                _tts_pipeline.reconfigure_tts_mode(cuda_graph=False, concurrency=2)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"TTS mode switch failed: {e}")
+        # 同步到 Settings 页
+        main_win = self._get_main_window()
+        if main_win and hasattr(main_win, 'settingInterface'):
+            si = main_win.settingInterface
+            if hasattr(si, 'ttsModeCard'):
+                si.ttsModeCard.setValue(text)
 
     def append_user_bubble(self, text):
         bubble = ChatBubble('user', text)
@@ -673,7 +766,18 @@ class SettingInterface(ScrollArea):
         )
         self.subtitleCard.switchButton.checkedChanged.connect(self._on_subtitle_changed)
         self.chatGroup.addSettingCard(self.subtitleCard)
-        
+
+        self.ttsModeCard = ComboBoxSettingCard(
+            OptionsConfigItem("TTS", "Mode", "Parallel ×2", OptionsValidator(["Parallel ×2", "CUDA Graph ×1"])),
+            FIF.TILES,
+            "TTS Inference Mode",
+            "Parallel ×2: 2-slot concurrent | CUDA Graph ×1: single, faster first sentence",
+            texts=["Parallel ×2", "CUDA Graph ×1"],
+            parent=self.chatGroup
+        )
+        self.ttsModeCard.comboBox.currentTextChanged.connect(self._on_tts_mode_changed)
+        self.chatGroup.addSettingCard(self.ttsModeCard)
+
         self.vBoxLayout.addWidget(self.chatGroup)
         
         # Sync initial state
@@ -698,7 +802,10 @@ class SettingInterface(ScrollArea):
             self.convCard.setChecked(getattr(main_module, 'ENABLE_CONVERSATION', True))
             self.sprintCard.setChecked(getattr(main_module, 'FIRST_SENTENCE_SPRINT', True))
             self.subtitleCard.setChecked(getattr(main_module, 'SHOW_SUBTITLE_WINDOW', False))
-            
+            import os
+            cuda_graph_on = os.environ.get('ENABLE_CUDA_GRAPH', '0') == '1'
+            self.ttsModeCard.setValue("CUDA Graph ×1" if cuda_graph_on else "Parallel ×2")
+
             self._update_visibility()
 
     def _update_visibility(self):
@@ -711,6 +818,16 @@ class SettingInterface(ScrollArea):
             main_module.LLM_PROVIDER = text
             main_module.USE_LOCAL_LLM = (text == "local")
         self._update_visibility()
+        # 反向同步到 Chat model bar
+        main_win = self._get_main_window()
+        if main_win and hasattr(main_win, 'chatInterface'):
+            ci = main_win.chatInterface
+            if hasattr(ci, 'provider_combo'):
+                ci.provider_combo.blockSignals(True)
+                idx = ci.provider_combo.findText(text)
+                if idx >= 0:
+                    ci.provider_combo.setCurrentIndex(idx)
+                ci.provider_combo.blockSignals(False)
 
     def _on_local_type_changed(self, text):
         main_module = get_main_module()
@@ -813,6 +930,39 @@ class SettingInterface(ScrollArea):
                 main_module.start_floating_subtitle()
             else:
                 main_module.stop_floating_subtitle()
+
+    def _on_tts_mode_changed(self, text):
+        try:
+            import tts.pipeline as _tts_pipeline
+            if text == "CUDA Graph ×1":
+                _tts_pipeline.reconfigure_tts_mode(cuda_graph=True, concurrency=1)
+                msg = "CUDA Graph serial — faster first sentence"
+            else:
+                _tts_pipeline.reconfigure_tts_mode(cuda_graph=False, concurrency=2)
+                msg = "Parallel ×2 — higher throughput"
+            main_win = self._get_main_window()
+            anchor = main_win if main_win else self
+            InfoBar.success(
+                title="TTS Mode Updated",
+                content=msg,
+                orient=Qt.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=3000,
+                parent=anchor,
+            )
+            # 反向同步到 Chat model bar
+            if main_win and hasattr(main_win, 'chatInterface'):
+                ci = main_win.chatInterface
+                if hasattr(ci, 'tts_mode_combo'):
+                    ci.tts_mode_combo.blockSignals(True)
+                    idx = ci.tts_mode_combo.findText(text)
+                    if idx >= 0:
+                        ci.tts_mode_combo.setCurrentIndex(idx)
+                    ci.tts_mode_combo.blockSignals(False)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"TTS mode switch failed: {e}")
 
 class LiveApiFloatButton(QWidget):
     """始终置顶的 Live API 快捷开关悬浮窗，不在任务栏显示，可拖动。"""

@@ -84,22 +84,60 @@ LM_STUDIO_URL     = _str("LM_STUDIO_URL", "http://localhost:1234")
 # llama-server 可执行文件路径（本机绝对路径，写在 .env 中）
 LOCAL_LLM_CLI_PATH = _str("LOCAL_LLM_CLI_PATH")
 
-# llama-server 启动参数（各关键值可独立通过 .env 覆盖）
-_LLM_MODEL_FILE = _str("LOCAL_LLM_CLI_MODEL_PATH")   # .gguf 模型文件完整路径
-_LLM_PORT       = _str("LOCAL_LLM_CLI_PORT",    "8080")
-_LLM_THREADS    = _str("LOCAL_LLM_CLI_THREADS", "12")
-_LLM_CONTEXT    = _str("LOCAL_LLM_CLI_CONTEXT", "4096")
-_LLM_NGL        = _str("LOCAL_LLM_CLI_NGL",     "0")   # GPU 层数，0 = 全 CPU
+# llama-cli / llama-server 启动参数（各关键值可独立通过 .env 覆盖）
+_LLM_MODEL_FILE    = _str("LOCAL_LLM_CLI_MODEL_PATH")        # .gguf 模型文件完整路径
+_LLM_PORT          = _str("LOCAL_LLM_CLI_PORT",         "8080")
+_LLM_THREADS       = _str("LOCAL_LLM_CLI_THREADS",      "4")
+_LLM_CONTEXT       = _str("LOCAL_LLM_CLI_CONTEXT",      "4096")
+_LLM_NGL           = _str("LOCAL_LLM_CLI_NGL",          "99")  # GPU 层数，99 = 全 GPU
+_LLM_UBATCH        = _str("LOCAL_LLM_CLI_UBATCH_SIZE",  "512")
+_LLM_BATCH         = _str("LOCAL_LLM_CLI_BATCH_SIZE",   "2048")
+_LLM_TENSOR_SPLIT  = _str("LOCAL_LLM_CLI_TENSOR_SPLIT", "")    # 多卡分割比例（留空 = 不分卡）
 
-LOCAL_LLM_CLI_ARGS: list[str] = [
-    "-m",       _LLM_MODEL_FILE,
-    "-ngl",     _LLM_NGL,
+# llama-server 进程的 CUDA 可见性（用 nvidia-smi 序号隔离 GPU）
+# 默认 "1" = 仅 Ti SUPER；TTS 用 cuda:1 (Laptop GPU, internal PCIe)，完全隔离
+LOCAL_LLM_CUDA_VISIBLE_DEVICES = _str("LOCAL_LLM_CUDA_VISIBLE_DEVICES", "1")
+_LLM_CACHE_REUSE      = _str("LOCAL_LLM_CLI_CACHE_REUSE",      "256") # KV Cache 复用块数（仅 llama_server）
+_LLM_REASONING_BUDGET = _str("LOCAL_LLM_CLI_REASONING_BUDGET", "0")   # 0 = 禁用 Qwen3 思维链
+_LLM_N_PREDICT     = _str("LOCAL_LLM_CLI_N_PREDICT",    "512") # 单次最大生成 token（仅 cli）
+_LLM_TEMP          = _str("LOCAL_LLM_CLI_TEMP",         "0.7") # 温度（仅 cli）
+
+# cli 模式：llama-cli.exe 交互模式参数
+_cli_args: list[str] = [
+    "-m",            _LLM_MODEL_FILE,
+    "-ngl",          _LLM_NGL,
     "--no-mmap",
-    "-t",       _LLM_THREADS,
-    "-c",       _LLM_CONTEXT,
-    "--port",   _LLM_PORT,
-    "-a",       LOCAL_LLM_MODEL,
+    "-t",            _LLM_THREADS,
+    "-c",            _LLM_CONTEXT,
+    "-n",            _LLM_N_PREDICT,
+    "--temp",        _LLM_TEMP,
+    "--ubatch-size", _LLM_UBATCH,
+    "--batch-size",  _LLM_BATCH,
+    "--interactive",  # 交互模式（保持进程常驻，通过 stdin 接收问题）
+    "-r", "User:",   # 反向提示：检测到 "User:" 时停止输出
 ]
+if _LLM_TENSOR_SPLIT:
+    _cli_args += ["--tensor-split", _LLM_TENSOR_SPLIT]
+
+# llama_server 模式：llama-server.exe HTTP API 参数
+_server_args: list[str] = [
+    "-m",              _LLM_MODEL_FILE,
+    "-ngl",            _LLM_NGL,
+    "--no-mmap",
+    "-t",              _LLM_THREADS,
+    "-c",              _LLM_CONTEXT,
+    "--ubatch-size",   _LLM_UBATCH,
+    "--batch-size",    _LLM_BATCH,
+    "--cache-reuse",         _LLM_CACHE_REUSE,
+    "--reasoning-budget",    _LLM_REASONING_BUDGET,
+    "--chat-template-kwargs", '{"enable_thinking": false}',
+    "--port",                _LLM_PORT,
+    "-a",              LOCAL_LLM_MODEL,
+]
+if _LLM_TENSOR_SPLIT:
+    _server_args += ["--tensor-split", _LLM_TENSOR_SPLIT]
+
+LOCAL_LLM_CLI_ARGS: list[str] = _cli_args if LOCAL_LLM_TYPE == "cli" else _server_args
 
 # 角色人格 System Prompt（非密钥，保留在代码中；可通过 .env LOCAL_LLM_SYSTEM_PROMPT 整体覆盖）
 _DEFAULT_SYSTEM_PROMPT = (
