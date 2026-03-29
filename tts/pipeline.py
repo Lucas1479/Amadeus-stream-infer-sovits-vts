@@ -49,6 +49,23 @@ _player = None
 _pending_sentence_items = None
 _play_queue = None
 _llm_warmup_fn = None   # remote_llm_query，供 warmup_graph_pipeline 使用
+_exp_tts_semaphore = None  # 并发合成信号量，由 main.py 创建后注入
+
+
+def reconfigure_tts_mode(cuda_graph: bool, concurrency: int) -> None:
+    """热更新 TTS 推理模式（GUI 切换时调用，当前无任务时最安全）。
+
+    cuda_graph=True  + concurrency=1 → CUDA Graph 串行模式（首句更快）
+    cuda_graph=False + concurrency=2 → 并行模式（吞吐量优先）
+    """
+    global _exp_tts_semaphore
+    import os
+    os.environ['ENABLE_CUDA_GRAPH'] = '1' if cuda_graph else '0'
+    _exp_tts_semaphore = asyncio.Semaphore(concurrency)
+    logger.info(
+        f"[TTS Mode] 已切换 → CUDA_Graph={'ON' if cuda_graph else 'OFF'}, "
+        f"semaphore={concurrency}"
+    )
 
 
 def configure(
@@ -59,10 +76,11 @@ def configure(
     pending_sentence_items=None,
     play_queue=None,
     llm_warmup_fn=None,
+    exp_tts_semaphore=None,
 ):
     """在 async main() 完成运行时初始化后调用，注入所有运行时依赖。"""
     global _tts_inferencer, _tts_executor, _playback_manager, _player
-    global _pending_sentence_items, _play_queue, _llm_warmup_fn
+    global _pending_sentence_items, _play_queue, _llm_warmup_fn, _exp_tts_semaphore
     if tts_inferencer is not None:
         _tts_inferencer = tts_inferencer
     if tts_executor is not None:
@@ -77,6 +95,8 @@ def configure(
         _play_queue = play_queue
     if llm_warmup_fn is not None:
         _llm_warmup_fn = llm_warmup_fn
+    if exp_tts_semaphore is not None:
+        _exp_tts_semaphore = exp_tts_semaphore
 
 
 # =============================================================================
@@ -277,24 +297,35 @@ async def speak_stream(text):
 
 
 async def speak_stream_graph_serial(text, sentence_id, is_first_sentence=False):
-    """Graph 模式专用：全局锁确保串行推理，播放仍可与下一句推理并行。"""
+    """Graph 模式专用：全局锁确保串行推理，合成完即释放锁让下一句并行合成。"""
     global graph_tts_lock
     if graph_tts_lock is None:
         graph_tts_lock = asyncio.Lock()
     logger.info(f"[Graph Serial] 等待获取串行推理锁: {sentence_id}")
-    async with graph_tts_lock:
-        start_time = time.time()
-        logger.info(f"[Graph Serial] 已获取锁，开始串行推理: {sentence_id}")
-        try:
-            await speak_stream_enhanced_asyncio_queue(
-                text,
-                sentence_id,
-                is_first_sentence=is_first_sentence,
-                force_graph=True,
-            )
-        finally:
-            elapsed = time.time() - start_time
-            logger.info(f"[Graph Serial] 释放串行推理锁: {sentence_id}，TTS耗时 {elapsed:.2f}s")
+    await graph_tts_lock.acquire()
+    start_time = time.time()
+    logger.info(f"[Graph Serial] 已获取锁，开始串行推理: {sentence_id}")
+
+    _lock_released = False
+    def _release_lock():
+        nonlocal _lock_released
+        if _lock_released:
+            return
+        _lock_released = True
+        elapsed = time.time() - start_time
+        logger.info(f"[Graph Serial] 释放串行推理锁: {sentence_id}，TTS耗时 {elapsed:.2f}s")
+        graph_tts_lock.release()
+
+    try:
+        await speak_stream_enhanced_asyncio_queue(
+            text,
+            sentence_id,
+            is_first_sentence=is_first_sentence,
+            force_graph=True,
+            on_synthesis_done=_release_lock,
+        )
+    finally:
+        _release_lock()  # 兜底：异常时也确保锁被释放
 
 
 async def speak_stream_enhanced(text, sentence_id, is_first_sentence=False, chunk_size_seconds=None):
@@ -381,7 +412,8 @@ async def speak_stream_enhanced(text, sentence_id, is_first_sentence=False, chun
 
 
 async def speak_stream_enhanced_asyncio_queue(
-    text, sentence_id, is_first_sentence=False, *, force_graph: bool = False
+    text, sentence_id, is_first_sentence=False, *, force_graph: bool = False,
+    on_synthesis_done=None,
 ):
     """新版生产者：合成一句完整的音频，然后提交给 PlaybackManager。"""
     try:
@@ -441,23 +473,40 @@ async def speak_stream_enhanced_asyncio_queue(
             if len(audio_chunks) == 1:
                 logger.info(f"[TTS-CHUNK] 首个音频块生成: {sentence_id} ({len(audio_chunk)} samples)")
 
-    if audio_chunks and _playback_manager is not None:
-        full_audio_data = np.concatenate(audio_chunks)
-        logger.info(f"[监控] TTS合成完成，准备提交播放列表: {sentence_id}")
-        sentence_seq = _parse_sentence_seq(sentence_id)
-        if USE_FIRST_SENTENCE_SPRINT:
-            if sentence_seq == 2:
-                logger.info("[串音修复] 第二句合成完成，等待第一句播放完成后再播放")
-                await _playback_manager.player_is_ready.wait()
-                logger.info("[串音修复] 第一句播放完成，第二句开始播放")
+    # 合成完成后立即释放锁/信号量，不等待播放，让下一句可以立刻开始合成
+    _released = False
+    def _release_now():
+        nonlocal _released
+        if _released:
+            return
+        _released = True
+        if on_synthesis_done is not None:
+            on_synthesis_done()
+        if _exp_tts_semaphore is not None:
+            _exp_tts_semaphore.release()
+            logger.debug(f"[Semaphore] 合成完成，释放信号量: {sentence_id}")
+
+    try:
+        if audio_chunks and _playback_manager is not None:
+            full_audio_data = np.concatenate(audio_chunks)
+            logger.info(f"[监控] TTS合成完成，准备提交播放列表: {sentence_id}")
+            sentence_seq = _parse_sentence_seq(sentence_id)
+            _release_now()  # 合成已完成，立即释放，让下一句开始合成
+            if USE_FIRST_SENTENCE_SPRINT:
+                if sentence_seq == 2:
+                    logger.info("[串音修复] 第二句合成完成，等待第一句播放完成后再播放")
+                    await _playback_manager.player_is_ready.wait()
+                    logger.info("[串音修复] 第一句播放完成，第二句开始播放")
+            else:
+                if sentence_seq == 2:
+                    logger.info("[串音修复] 批量模式：第二句等待第一句")
+                    await _playback_manager.player_is_ready.wait()
+                    logger.info("[串音修复] 第一句播放完成，第二句开始播放")
+            await _playback_manager.add_to_playlist(full_audio_data, sentence_id, text)
         else:
-            if sentence_seq == 2:
-                logger.info("[串音修复] 批量模式：第二句等待第一句")
-                await _playback_manager.player_is_ready.wait()
-                logger.info("[串音修复] 第一句播放完成，第二句开始播放")
-        await _playback_manager.add_to_playlist(full_audio_data, sentence_id, text)
-    else:
-        logger.warning(f"TTS任务未生成任何音频数据: {sentence_id}")
+            logger.warning(f"TTS任务未生成任何音频数据: {sentence_id}")
+    finally:
+        _release_now()  # 兜底：异常或空音频时也确保释放
 
 
 # =============================================================================
@@ -496,6 +545,10 @@ async def play_sentence_worker():
                 tts_coro = speak_stream_enhanced_asyncio_queue(sentence, sentence_id, is_first)
             else:
                 tts_coro = speak_stream_enhanced(sentence, sentence_id, is_first)
+
+            if _exp_tts_semaphore is not None:
+                await _exp_tts_semaphore.acquire()
+                logger.debug(f"[Semaphore] 获取信号量，开始合成: {sentence_id}")
 
             asyncio.create_task(tts_coro)
             _pending_sentence_items.task_done()
