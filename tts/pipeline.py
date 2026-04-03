@@ -53,6 +53,9 @@ _pending_sentence_items = None
 _play_queue = None
 _llm_warmup_fn = None   # remote_llm_query，供 warmup_graph_pipeline 使用
 _exp_tts_semaphore = None  # 并发合成信号量，由 main.py 创建后注入
+_tts_runtime_available = True
+_tts_runtime_status = "Ready: TTS runtime assets are available."
+_tts_runtime_warning_emitted = False
 
 
 def reconfigure_tts_mode(cuda_graph: bool, concurrency: int) -> None:
@@ -85,10 +88,13 @@ def configure(
     play_queue=None,
     llm_warmup_fn=None,
     exp_tts_semaphore=None,
+    tts_runtime_available=None,
+    tts_runtime_status=None,
 ):
     """在 async main() 完成运行时初始化后调用，注入所有运行时依赖。"""
     global _tts_inferencer, _tts_executor, _playback_manager, _player
     global _pending_sentence_items, _play_queue, _llm_warmup_fn, _exp_tts_semaphore
+    global _tts_runtime_available, _tts_runtime_status, _tts_runtime_warning_emitted
     if tts_inferencer is not None:
         _tts_inferencer = tts_inferencer
     if tts_executor is not None:
@@ -105,6 +111,12 @@ def configure(
         _llm_warmup_fn = llm_warmup_fn
     if exp_tts_semaphore is not None:
         _exp_tts_semaphore = exp_tts_semaphore
+    if tts_runtime_available is not None:
+        _tts_runtime_available = tts_runtime_available
+        # 运行态变化后重置一次 warning 节流，避免旧状态把新提示吞掉。
+        _tts_runtime_warning_emitted = False
+    if tts_runtime_status is not None:
+        _tts_runtime_status = tts_runtime_status
 
 
 # =============================================================================
@@ -186,14 +198,26 @@ _REF_AUDIO = (
 _REF_TEXT = TTS_REF_TEXT
 
 
+def _tts_is_ready() -> bool:
+    return _tts_runtime_available and _tts_inferencer is not None
+
+
+def _warn_tts_unavailable_once(context: str) -> None:
+    global _tts_runtime_warning_emitted
+    if _tts_runtime_warning_emitted:
+        return
+    _tts_runtime_warning_emitted = True
+    logger.warning("%s %s", context, _tts_runtime_status)
+
+
 async def generate_segment_improved(text_segment):
     """改进的分段生成函数（本地推理），增加性能监控和错误处理。"""
-    if _tts_inferencer is None:
-        logger.error("TTS推理器未初始化，无法生成语音")
-        return np.zeros(16000, dtype=np.float32), 16000
+    if not _tts_is_ready():
+        _warn_tts_unavailable_once("跳过分段语音合成。")
+        return None
     if not os.path.exists(_REF_AUDIO):
         logger.error("参考音频不存在: %s。请在 .env 中填写 TTS_REF_AUDIO_PATH。", _REF_AUDIO)
-        return np.zeros(16000, dtype=np.float32), 16000
+        return None
 
     params = get_sovits_params(text_segment)
     params['ref_audio_path'] = _REF_AUDIO
@@ -229,7 +253,7 @@ async def generate_segment_improved(text_segment):
         infer_time = time.time() - infer_start
         if audio_data is None or not isinstance(audio_data, np.ndarray):
             logger.warning("生成的音频无效或类型不正确")
-            return np.zeros(16000, dtype=np.float32), 16000
+            return None
         logger.info(f"TTS推理完成，用时: {infer_time:.2f}s，音频长度: {len(audio_data)}")
         if audio_data.dtype != np.float32:
             audio_data = audio_data.astype(np.float32)
@@ -237,11 +261,14 @@ async def generate_segment_improved(text_segment):
         return audio_data, sr
     except Exception as e:
         logger.error(f"本地TTS推理失败: {e}\n{traceback.format_exc()}")
-        return np.zeros(16000, dtype=np.float32), 16000
+        return None
 
 
 async def speak_improved(text):
     """改进的语音处理流程（非流式），增加性能监控。"""
+    if not _tts_is_ready():
+        _warn_tts_unavailable_once("跳过整段语音合成。")
+        return
     import re
     overall_start = time.time()
     sentences = re.split(r"[.!?\\n]", text)
@@ -269,8 +296,11 @@ async def speak_improved(text):
 
 async def speak_stream(text):
     """简化的流式语音处理流程 —— 移除翻译阻塞。"""
-    if _tts_inferencer is None:
-        logger.error("TTS推理器未初始化，无法生成语音")
+    if not _tts_is_ready():
+        _warn_tts_unavailable_once("跳过流式语音合成。")
+        return
+    if not os.path.exists(_REF_AUDIO):
+        logger.error("参考音频不存在: %s。请在 .env 中填写 TTS_REF_AUDIO_PATH。", _REF_AUDIO)
         return
 
     overall_start = time.time()
@@ -353,8 +383,11 @@ async def speak_stream_enhanced(text, sentence_id, is_first_sentence=False, chun
         _sha = "sha_err"
     logger.info(f"[TTS-FUNC-ENTER] func=speak_stream_enhanced id={sentence_id} sha1={_sha} first={is_first_sentence}")
 
-    if _tts_inferencer is None:
-        logger.error("TTS推理器未初始化，无法生成语音")
+    if not _tts_is_ready():
+        _warn_tts_unavailable_once("跳过增强流式语音合成。")
+        return
+    if not os.path.exists(_REF_AUDIO):
+        logger.error("参考音频不存在: %s。请在 .env 中填写 TTS_REF_AUDIO_PATH。", _REF_AUDIO)
         return
 
     overall_start = time.time()
@@ -442,8 +475,11 @@ async def speak_stream_enhanced_asyncio_queue(
         f"id={sentence_id} sha1={_sha} first={is_first_sentence}"
     )
 
-    if _tts_inferencer is None:
-        logger.error("TTS推理器未初始化，无法合成语音")
+    if not _tts_is_ready():
+        _warn_tts_unavailable_once("跳过异步队列语音合成。")
+        return
+    if not os.path.exists(_REF_AUDIO):
+        logger.error("参考音频不存在: %s。请在 .env 中填写 TTS_REF_AUDIO_PATH。", _REF_AUDIO)
         return
 
     def tts_producer(loop, queue, producer_text, producer_params):
@@ -552,6 +588,13 @@ async def play_sentence_worker():
             cnt = play_sentence_worker._intent_counts.get(sentence_id, 0) + 1
             play_sentence_worker._intent_counts[sentence_id] = cnt
             logger.info(f"[TTS-START-INTENT] id={sentence_id} sha1={_sha} first={is_first} intent_count={cnt}")
+
+            # 无模型降级模式下，句子仍会进入调度队列；这里必须在获取信号量前短路，
+            # 否则后台任务会因为“永远不会开始的合成”把队列和并发槽位一起拖住。
+            if not _tts_is_ready():
+                _warn_tts_unavailable_once("跳过句子级语音合成任务。")
+                _pending_sentence_items.task_done()
+                continue
 
             graph_enabled = os.environ.get('ENABLE_CUDA_GRAPH', '0') == '1'
             if graph_enabled:

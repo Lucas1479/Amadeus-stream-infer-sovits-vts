@@ -90,7 +90,7 @@ from config.settings import (
     AWS_BEDROCK_CONNECTION_POOL_SIZE, AWS_BEDROCK_MAX_KEEPALIVE,
     AWS_BEDROCK_KEEPALIVE_EXPIRY,
     # TTS
-    TTS_DEVICE, TTS_GPT_MODEL_PATH, TTS_SOVITS_MODEL_PATH,
+    TTS_DEVICE, TTS_GPT_MODEL_PATH, TTS_SOVITS_MODEL_PATH, TTS_REF_AUDIO_PATH,
     SEGMENT_CHAR_LIMIT,
     USE_EXPERIMENTAL_TTS_STREAM, EXP_TTS_MAX_CONCURRENCY,
     USE_FIRST_SENTENCE_SPRINT, DISPLAY_FALLBACK_WINDOW_SEC,
@@ -101,6 +101,7 @@ from core.runtime_compat import (
     configure_torch_runtime,
     effective_cuda_graph_enabled,
 )
+from core.runtime_assets import inspect_tts_runtime_assets
 
 # VTS token 文件路径别名（历史兼容，内部代码使用 TOKEN_FILE）
 TOKEN_FILE = VTS_TOKEN_FILE
@@ -362,26 +363,38 @@ gui_app = None
 gui_window = None
 gemini_client = None
 gemini_model = None
+SHOW_SUBTITLE_WINDOW = False
 
 
 # ===== TTS初始化 =====
 def init_tts_system():
     """初始化TTS系统,增强错误处理"""
+    global TTS_RUNTIME_AVAILABLE, TTS_RUNTIME_STATUS, TTS_RUNTIME_TOOLTIP, TTS_RUNTIME_MISSING
     try:
         logger.info("正在初始化TTS系统...")
         resolved_device = os.environ.get("AMADEUS_RESOLVED_TTS_DEVICE", RESOLVED_TTS_DEVICE)
         logger.info(f"🎛️ TTS 运行设备: requested={TTS_DEVICE}, resolved={resolved_device}")
 
-        # 定义模型路径（从 .env / config.settings 读取）
         gpt_path = TTS_GPT_MODEL_PATH if os.path.isabs(TTS_GPT_MODEL_PATH) else os.path.join(root_dir, TTS_GPT_MODEL_PATH)
         sovits_path = TTS_SOVITS_MODEL_PATH if os.path.isabs(TTS_SOVITS_MODEL_PATH) else os.path.join(root_dir, TTS_SOVITS_MODEL_PATH)
+        runtime_assets = inspect_tts_runtime_assets(
+            root_dir=root_dir,
+            gpt_model_path=TTS_GPT_MODEL_PATH,
+            sovits_model_path=TTS_SOVITS_MODEL_PATH,
+            ref_audio_path=TTS_REF_AUDIO_PATH,
+        )
+        TTS_RUNTIME_AVAILABLE = runtime_assets.available
+        TTS_RUNTIME_STATUS = runtime_assets.summary
+        TTS_RUNTIME_TOOLTIP = runtime_assets.tooltip
+        TTS_RUNTIME_MISSING = runtime_assets.missing
 
-        # 检查文件是否存在
-        if not os.path.exists(gpt_path):
-            logger.error(f"❌ GPT模型文件不存在: {gpt_path}")
-            return None
-        if not os.path.exists(sovits_path):
-            logger.error(f"❌ SoVITS模型文件不存在: {sovits_path}")
+        # 缺少运行资源时先进入文本模式，而不是整个程序直接退出。
+        # 这样用户可以先验证 GUI / LLM / 外设链路，后续只需补齐资源再重启。
+        if not runtime_assets.available:
+            logger.warning(runtime_assets.summary)
+            for item in runtime_assets.missing:
+                logger.warning("  - %s", item)
+            logger.warning("TTS 将保持未就绪状态；程序会继续以文本模式启动。")
             return None
 
         # 初始化TTSInferencer
@@ -394,17 +407,57 @@ def init_tts_system():
             sovits_path=sovits_path
         )
 
+        TTS_RUNTIME_AVAILABLE = True
+        TTS_RUNTIME_STATUS = "Ready: TTS runtime assets are available."
+        TTS_RUNTIME_TOOLTIP = "TTS runtime assets are ready."
+        TTS_RUNTIME_MISSING = []
         logger.info("TTS系统初始化成功")
         return tts_inferencer
     except Exception as e:
+        TTS_RUNTIME_AVAILABLE = False
+        TTS_RUNTIME_STATUS = f"Warning: TTS unavailable — initialization failed ({e})."
+        TTS_RUNTIME_TOOLTIP = TTS_RUNTIME_STATUS
+        TTS_RUNTIME_MISSING = [str(e)]
         logger.error(f"❌ TTS系统初始化失败: {str(e)}")
         logger.error(traceback.format_exc())
-        print(f"\n严重错误: TTS系统初始化失败\n{str(e)}\n")
-        print("请检查模型路径是否正确,以及所有必要的文件是否存在")
         return None
 
 # 全局TTS实例
 tts_inferencer = None
+TTS_RUNTIME_AVAILABLE = False
+TTS_RUNTIME_STATUS = "Warning: TTS unavailable — runtime assets have not been checked yet."
+TTS_RUNTIME_TOOLTIP = "TTS runtime assets have not been checked yet."
+TTS_RUNTIME_MISSING = []
+
+
+def start_floating_subtitle():
+    """按需启动悬浮字幕窗。"""
+    global subtitle_window_instance, SHOW_SUBTITLE_WINDOW
+    if not SUBTITLE_AVAILABLE:
+        logger.warning("悬浮字幕窗不可用，跳过启动。")
+        return None
+    if sys.platform == "darwin":
+        # Tk 在 macOS 上要求主线程创建 NSWindow；当前字幕窗实现使用后台线程，
+        # 先明确禁用，避免它把主程序启动路径直接带崩。
+        SHOW_SUBTITLE_WINDOW = False
+        warning = "Warning: Floating subtitle window is disabled on macOS for now."
+        logger.warning(warning)
+        if gui_window:
+            gui_window.handle_status(warning)
+        return None
+    if subtitle_window_instance is None:
+        subtitle_window_instance = init_subtitle_window(GEMINI_API_KEY)
+    elif hasattr(subtitle_window_instance, "show"):
+        subtitle_window_instance.show()
+    return subtitle_window_instance
+
+
+def stop_floating_subtitle():
+    """关闭悬浮字幕窗（若已创建则隐藏）。"""
+    global SHOW_SUBTITLE_WINDOW
+    SHOW_SUBTITLE_WINDOW = False
+    if subtitle_window_instance and hasattr(subtitle_window_instance, "hide"):
+        subtitle_window_instance.hide()
 
 
 # ===== 改进的VTS连接管理器 =====
@@ -2097,7 +2150,7 @@ if __name__ == "__main__":
         # 初始化核心组件
         tts_inferencer = init_tts_system()
         if tts_inferencer is None:
-            raise RuntimeError("TTS system failed to initialize.")
+            logger.warning("TTS 未就绪，当前会以文本模式继续运行。")
 
         vts_manager = VTSConnectionManager(VTS_WS_URL)
         player = StreamPlayerWithBuffer(
@@ -2170,15 +2223,16 @@ if __name__ == "__main__":
         if cuda_graph_env:
             asyncio.create_task(warmup_graph_pipeline())
 
-        # 启动字幕窗和GUI
-        if SUBTITLE_AVAILABLE:
-            subtitle_window_instance = init_subtitle_window(GEMINI_API_KEY)
+        # 悬浮字幕是可选功能；按需初始化，避免把 Tk 线程限制带进主启动路径。
+        if SUBTITLE_AVAILABLE and SHOW_SUBTITLE_WINDOW:
+            subtitle_window_instance = start_floating_subtitle()
 
         # 注入翻译函数到 PreTranslationCache（需在 gemini_client 初始化后）
         pre_translation_cache.set_translate_fn(translate_text_async)
 
         # 向 tts.subtitle 注入运行时依赖（字幕窗口 + PlaybackManager）
-        _subtitle_mod.configure(subtitle_window_instance, SUBTITLE_AVAILABLE, playback_manager)
+        subtitle_runtime_available = SUBTITLE_AVAILABLE and subtitle_window_instance is not None
+        _subtitle_mod.configure(subtitle_window_instance, subtitle_runtime_available, playback_manager)
 
         # ── 注入 live/sidecar 运行时依赖 ──────────────────────────────────────
         _live_mod.configure(
@@ -2198,6 +2252,8 @@ if __name__ == "__main__":
             play_queue=play_queue,
             llm_warmup_fn=remote_llm_query,
             exp_tts_semaphore=exp_tts_semaphore,
+            tts_runtime_available=TTS_RUNTIME_AVAILABLE,
+            tts_runtime_status=TTS_RUNTIME_STATUS,
         )
 
         # ── 注入 vts/action 运行时依赖 ────────────────────────────────────────
@@ -2211,6 +2267,8 @@ if __name__ == "__main__":
         _llm_client_mod.configure(llm_provider=LLM_PROVIDER)
 
         gui_window = launch_subtitle_gui_fn(app, gui_callback, listen_and_process)
+        if not TTS_RUNTIME_AVAILABLE:
+            gui_window.handle_status(TTS_RUNTIME_STATUS)
 
         # 确保窗口显示在最前面
         gui_window.raise_()

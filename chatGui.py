@@ -36,6 +36,16 @@ def _get_mm_mod():
     """返回 multimodal.controller 模块（重构后 MULTIMODAL_ENABLED 移到此处）。"""
     return sys.modules.get('multimodal.controller')
 
+
+def _get_tts_runtime_state():
+    main_module = get_main_module()
+    if not main_module:
+        return True, ""
+    return (
+        getattr(main_module, 'TTS_RUNTIME_AVAILABLE', True),
+        getattr(main_module, 'TTS_RUNTIME_TOOLTIP', ""),
+    )
+
 class SignalBridge(QObject):
     response_signal = pyqtSignal(str)
     status_signal = pyqtSignal(str)
@@ -213,7 +223,8 @@ class ChatInterface(QWidget):
         lbl_provider = QLabel("🤖 Model:", self.model_bar)
         lbl_provider.setStyleSheet("font-size: 13px; color: #333; background: transparent; border: none;")
         self.provider_combo = ComboBox(self.model_bar)
-        self.provider_combo.addItems(["deepseek", "gemini", "bedrock", "local"])
+        # GUI 选项要和主程序 provider 列表同步，否则新增 provider 后界面无法切换。
+        self.provider_combo.addItems(["deepseek", "openai", "gemini", "bedrock", "local"])
         self.provider_combo.setFixedWidth(120)
         self.provider_combo.currentTextChanged.connect(self._on_bar_provider_changed)
 
@@ -294,6 +305,12 @@ class ChatInterface(QWidget):
             self.tts_mode_combo.blockSignals(True)
             self.tts_mode_combo.setCurrentIndex(idx)
             self.tts_mode_combo.blockSignals(False)
+        self._sync_tts_controls_state()
+
+    def _sync_tts_controls_state(self):
+        available, tooltip = _get_tts_runtime_state()
+        self.tts_mode_combo.setEnabled(available)
+        self.tts_mode_combo.setToolTip("" if available else tooltip)
 
     def _on_bar_provider_changed(self, text):
         main_module = get_main_module()
@@ -308,6 +325,17 @@ class ChatInterface(QWidget):
                 si.providerCard.setValue(text)
 
     def _on_bar_tts_mode_changed(self, text):
+        available, tooltip = _get_tts_runtime_state()
+        if not available:
+            InfoBar.warning(
+                title="TTS Unavailable",
+                content=tooltip,
+                orient=Qt.Horizontal,
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=4000,
+                parent=self.window(),
+            )
+            return
         try:
             import tts.pipeline as _tts_pipeline
             if text == "CUDA Graph ×1":
@@ -676,11 +704,11 @@ class SettingInterface(ScrollArea):
         self.modelGroup = SettingCardGroup("Model Configuration", self.scrollWidget)
         
         self.providerCard = ComboBoxSettingCard(
-            OptionsConfigItem("Model", "Provider", "deepseek", OptionsValidator(["deepseek", "gemini", "bedrock", "local"])),
+            OptionsConfigItem("Model", "Provider", "deepseek", OptionsValidator(["deepseek", "openai", "gemini", "bedrock", "local"])),
             FIF.ROBOT,
             "LLM Provider",
             "Select the language model provider",
-            texts=["deepseek", "gemini", "bedrock", "local"],
+            texts=["deepseek", "openai", "gemini", "bedrock", "local"],
             parent=self.modelGroup
         )
         self.providerCard.comboBox.currentTextChanged.connect(self._on_provider_changed)
@@ -805,8 +833,15 @@ class SettingInterface(ScrollArea):
             self.subtitleCard.setChecked(getattr(main_module, 'SHOW_SUBTITLE_WINDOW', False))
             cuda_graph_on = effective_cuda_graph_enabled()
             self.ttsModeCard.setValue(get_tts_mode_label(cuda_graph_on))
+            self._sync_tts_card_state()
 
             self._update_visibility()
+
+    def _sync_tts_card_state(self):
+        available, tooltip = _get_tts_runtime_state()
+        self.ttsModeCard.comboBox.setEnabled(available)
+        self.ttsModeCard.setToolTip("" if available else tooltip)
+        self.ttsModeCard.comboBox.setToolTip("" if available else tooltip)
 
     def _update_visibility(self):
         is_local = self.providerCard.comboBox.currentText() == "local"
@@ -932,6 +967,20 @@ class SettingInterface(ScrollArea):
                 main_module.stop_floating_subtitle()
 
     def _on_tts_mode_changed(self, text):
+        available, tooltip = _get_tts_runtime_state()
+        if not available:
+            main_win = self._get_main_window()
+            anchor = main_win if main_win else self
+            InfoBar.warning(
+                title="TTS Unavailable",
+                content=tooltip,
+                orient=Qt.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=4000,
+                parent=anchor,
+            )
+            return
         try:
             import tts.pipeline as _tts_pipeline
             if text == "CUDA Graph ×1":
@@ -1221,9 +1270,12 @@ class SubtitleWindow(FluentWindow):
         self.signals.status_signal.emit(status_text)
         
     def _update_status(self, text):
-        # We can use InfoBar or a custom status label. For now, let's use InfoBar for errors, or just ignore normal status
+        # 启动降级模式后，主程序会通过 Warning 状态把“缺哪些资源”直接打到 GUI。
+        # 这里把 warning 单独展示出来，避免用户只看到静默置灰却不知道为什么。
         if "Error" in text or "エラー" in text:
             InfoBar.error(title='Status', content=text, orient=Qt.Horizontal, position=InfoBarPosition.TOP, duration=3000, parent=self)
+        elif "Warning" in text or "警告" in text or "unavailable" in text:
+            InfoBar.warning(title='Status', content=text, orient=Qt.Horizontal, position=InfoBarPosition.TOP, duration=5000, parent=self)
             
     def handle_user_input(self, text):
         self.signals.user_input_signal.emit(text)
