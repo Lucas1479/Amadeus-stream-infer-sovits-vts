@@ -57,6 +57,15 @@ GEMINI_API_KEY    = _str("GEMINI_API_KEY")
 GEMINI_MODEL_NAME = _str("GEMINI_MODEL_NAME", "gemini-2.5-flash")
 
 # ===========================================================================
+# LLM 提供商 — OpenAI
+# ===========================================================================
+# 单独补一组 OpenAI 配置，避免用户把 OpenAI Key 填进 .env 后项目却完全不读取。
+# 默认 base_url 指向官方 API；如需兼容代理或第三方网关，可在 .env 中覆盖。
+OPENAI_API_KEY    = _str("OPENAI_API_KEY")
+OPENAI_BASE_URL   = _str("OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENAI_MODEL_NAME = _str("OPENAI_MODEL_NAME", "gpt-4o-mini")
+
+# ===========================================================================
 # LLM 提供商 — AWS Bedrock
 # ===========================================================================
 AWS_BEDROCK_BEARER_TOKEN        = _str("AWS_BEARER_TOKEN_BEDROCK")
@@ -174,10 +183,19 @@ VTS_TOKEN_FILE = _str("VTS_TOKEN_FILE", "vts_auth_token.json")
 # ===========================================================================
 # TTS（GPT-SoVITS 推理）
 # ===========================================================================
-TTS_DEVICE          = _str("TTS_DEVICE", "cuda")
+TTS_DEVICE          = _str("TTS_DEVICE", "auto")
+# 兼容性改造后默认使用 auto：CUDA 主机仍优先走 CUDA；Apple Silicon 则默认走
+# 更稳的 CPU 路径，MPS 保留为显式 opt-in，避免把不完整的 MPS 支持当成默认行为。
 # 模型权重路径（相对于项目根或绝对路径，写在 .env 中）
 TTS_GPT_MODEL_PATH    = _str("TTS_GPT_MODEL_PATH")
 TTS_SOVITS_MODEL_PATH = _str("TTS_SOVITS_MODEL_PATH")
+# 参考音频与对应文本也改为 .env 可配，避免仓库里缺少硬编码样音时直接卡死。
+# 这样用户可以先用官方底模 + 自己的一段样音做最小可运行验证。
+TTS_REF_AUDIO_PATH    = _str("TTS_REF_AUDIO_PATH", "reference audio/kurisu_reference.wav")
+TTS_REF_TEXT          = _str(
+    "TTS_REF_TEXT",
+    "そういえば,正式に自己紹介していませんでしたね……牧瀬紅莉栖です.改めてまして,よろしく",
+)
 
 SEGMENT_CHAR_LIMIT           = _int("SEGMENT_CHAR_LIMIT", 140)
 USE_EXPERIMENTAL_TTS_STREAM  = _bool("USE_EXPERIMENTAL_TTS_STREAM", True)

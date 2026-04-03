@@ -5,6 +5,8 @@
 #   1. Install PyTorch for your CUDA version first / 先按 CUDA 版本安装 PyTorch：
 #      https://pytorch.org/get-started/locally/
 #   2. pip install -r requirements.txt
+#   3. 当前锁定的 numpy / numba 组合以 Python 3.10 为目标；
+#      在 3.11+ 环境下会直接安装失败，因此 Mac 兼容路径也统一建议 Python 3.10。
 # =============================================================================
 
 # ── GPT-SoVITS Core Inference / GPT-SoVITS 核心推理 ──────────────────────────
@@ -60,6 +62,7 @@ aiohttp>=3.8.0
 
 # ── GUI ──────────────────────────────────────────────────────────────────────
 PyQt5>=5.15.0
+PyQt-Fluent-Widgets>=1.5.5
 # Qt + asyncio event loop bridge / Qt 与 asyncio 事件循环桥接
 qasync>=0.23.0
 
@@ -76,6 +79,7 @@ faster-whisper>=1.0.0
 websocket-client>=1.6.0
 
 # ── Multimodal Input / 多模态输入 ────────────────────────────────────────────
+opencv-python>=4.10.0
 # High-performance screen capture / 高性能屏幕截图
 mss>=9.0.0
 # Image processing for screenshots / 截图图像处理
