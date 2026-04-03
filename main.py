@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 import time
@@ -5,10 +6,8 @@ import json
 import base64
 import asyncio
 
-import logger
 import numpy as np
 import soundfile as sf
-import pyaudio
 import re
 import traceback
 from queue import Queue
@@ -18,19 +17,32 @@ import requests
 import aiohttp
 import websocket as ws
 import random
-import logging
 import tempfile
 import sys
-from PyQt5.QtWidgets import QApplication
 from sympy.physics.units import sr
 
-from chatGui import launch_subtitle_gui
 import google.generativeai as google_genai
-import speech_recognition as speech_rec
 import torch
 
-# 本地 Kurisu 专用 RAG 知识库
-from rag_system import RAGSystem
+# 先初始化日志，再导入其余可选模块。这样即使 GUI / 音频依赖缺失，
+# 兼容层也能给出可读日志，而不是在导入阶段静默崩掉。
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('vits_app.log')
+    ]
+)
+logger = logging.getLogger('vts_connector')
+
+try:
+    import pyaudio
+except ImportError as exc:
+    pyaudio = None
+    _PYAUDIO_IMPORT_ERROR = exc
+else:
+    _PYAUDIO_IMPORT_ERROR = None
 
 # 导入悬浮字幕窗
 try:
@@ -51,19 +63,6 @@ gpt_sovits_dir = os.path.join(root_dir, "GPT_SoVITS")
 sys.path.insert(0, gpt_sovits_dir)
 sys.path.insert(0, root_dir)
 
-from local_tts_infer import TTSInferencer
-
-# 设置更详细的日志记录
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('vits_app.log')  # 同时输出到文件
-    ]
-)
-logger = logging.getLogger('vts_connector')
-
 # 将其他库的日志级别调高,减少干扰
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("websocket").setLevel(logging.WARNING)
@@ -83,6 +82,7 @@ from config.settings import (
     # LLM providers
     DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL,
     GEMINI_API_KEY, GEMINI_MODEL_NAME,
+    OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL_NAME,
     AWS_BEDROCK_BEARER_TOKEN, AWS_BEDROCK_REGION,
     AWS_BEDROCK_MODEL_ID, AWS_BEDROCK_USE_INFERENCE_PROFILE,
     AWS_BEDROCK_INFERENCE_PROFILE_ID, AWS_BEDROCK_ENDPOINT,
@@ -97,9 +97,44 @@ from config.settings import (
     # OpenClaw
     OPENCLAW_BASE_URL, OPENCLAW_TOKEN, OPENCLAW_PROJECT_DIR,
 )
+from core.runtime_compat import (
+    configure_torch_runtime,
+    effective_cuda_graph_enabled,
+)
 
 # VTS token 文件路径别名（历史兼容，内部代码使用 TOKEN_FILE）
 TOKEN_FILE = VTS_TOKEN_FILE
+
+# 在模块加载阶段就解析一次目标设备，让后续导入和运行时逻辑共享同一结果。
+# 这样既能给 Mac 一个稳定默认值，也能保证非 CUDA 主机不会误开 CUDA Graph。
+RESOLVED_TTS_DEVICE = configure_torch_runtime(TTS_DEVICE, log=logger)
+
+
+def _require_pyaudio() -> None:
+    if pyaudio is None:
+        raise RuntimeError(
+            "PyAudio 未安装，无法启用本地音频播放。macOS 需要先安装 portaudio，再重新安装 pyaudio。"
+        ) from _PYAUDIO_IMPORT_ERROR
+
+
+def _load_gui_launcher():
+    # GUI 会连带导入 qfluentwidgets；把它延迟到真正启动窗口时再加载，
+    # 能把缺失依赖的报错收敛成一条可读消息，而不是在 main.py 导入阶段直接崩。
+    try:
+        from chatGui import launch_subtitle_gui
+    except ImportError as exc:
+        raise RuntimeError(
+            "GUI 依赖缺失，无法启动主界面。请确认已安装 PyQt5、qasync 和 PyQt-Fluent-Widgets。"
+        ) from exc
+    return launch_subtitle_gui
+
+
+def _get_rag_system_class():
+    # RAG 依赖 faiss / sentence-transformers。延迟导入可以避免在只排查
+    # GUI、配置或安装问题时被重依赖提前阻塞。
+    from rag_system import RAGSystem
+
+    return RAGSystem
 
 # ── 从工具模块导入无状态纯函数 ───────────────────────────────────────────────
 from tools.text_utils import (
@@ -334,6 +369,8 @@ def init_tts_system():
     """初始化TTS系统,增强错误处理"""
     try:
         logger.info("正在初始化TTS系统...")
+        resolved_device = os.environ.get("AMADEUS_RESOLVED_TTS_DEVICE", RESOLVED_TTS_DEVICE)
+        logger.info(f"🎛️ TTS 运行设备: requested={TTS_DEVICE}, resolved={resolved_device}")
 
         # 定义模型路径（从 .env / config.settings 读取）
         gpt_path = TTS_GPT_MODEL_PATH if os.path.isabs(TTS_GPT_MODEL_PATH) else os.path.join(root_dir, TTS_GPT_MODEL_PATH)
@@ -350,7 +387,9 @@ def init_tts_system():
         # 初始化TTSInferencer
         from local_tts_infer import TTSInferencer
         tts_inferencer = TTSInferencer(
-            device=TTS_DEVICE if (TTS_DEVICE == 'cpu' or torch.cuda.is_available()) else 'cpu',
+            # 设备在 runtime_compat 中已统一解析。这里直接消费解析后的结果，
+            # 避免主入口和推理层各自做一套不一致的回退判断。
+            device=resolved_device,
             gpt_path=gpt_path,
             sovits_path=sovits_path
         )
@@ -376,6 +415,7 @@ vts_manager = VTSConnectionManager(VTS_WS_URL)
 def play_audio_from_buffer(audio_data: np.ndarray, sample_rate: int):
     """播放音频并同步口型"""
     try:
+        _require_pyaudio()
         p = pyaudio.PyAudio()
         stream = p.open(format=pyaudio.paFloat32, channels=1, rate=sample_rate, output=True)
 
@@ -739,6 +779,24 @@ async def stream_llm_query(question, gui_callback=None):
             
             # 记录连接状态
             log_connection_info()
+
+        elif LLM_PROVIDER == "openai" and llm_client is None:
+            import httpx
+            http_client = httpx.Client(
+                limits=httpx.Limits(
+                    max_connections=10,
+                    max_keepalive_connections=5,
+                    keepalive_expiry=60.0
+                ),
+                timeout=httpx.Timeout(30.0),
+                http2=False
+            )
+            llm_client = OpenAI(
+                api_key=OPENAI_API_KEY,
+                base_url=OPENAI_BASE_URL,
+                http_client=http_client
+            )
+            logger.info("🚀 OpenAI客户端已初始化并启用连接池")
             
         elif LLM_PROVIDER == "gemini" and gemini_model is None:
             google_genai.configure(api_key=GEMINI_API_KEY)
@@ -855,7 +913,7 @@ async def stream_llm_query(question, gui_callback=None):
                 try:
                     if rag_system is None:
                         logger.info("🧠 初始化本地 RAG 知识库 (Kurisu)...")
-                        rag_system = RAGSystem()
+                        rag_system = _get_rag_system_class()()
                     context, dist, t_ms = rag_system.search(question, k=RAG_TOP_K)
                     logger.info(f"🔎 RAG 检索耗时: {t_ms:.2f} ms, 距离: {dist:.4f}")
                     if context and dist <= RAG_MAX_DISTANCE:
@@ -1200,6 +1258,64 @@ async def stream_llm_query(question, gui_callback=None):
                 if gui_callback: gui_callback(full_response)
 
                 # 逐字符检查，chunk 内出现句末符立即触发分句
+                await append_and_dispatch(content)
+                await asyncio.sleep(0.01)
+
+        elif LLM_PROVIDER == "openai":
+            system_prompt = "あなたは牧瀬紅莉栖.日本の科学者であり,母語は日本語です.\n\n【絶対遵守】\n1) 必ず日本語でのみ回答すること.ユーザーの言語が何であっても,日本語以外は一切使用しない.\n2) 中国語の文字・語句を絶対に使用しない.\n3) 自然で口語的な文体を保ち,牧瀬紅莉栖として一貫した口調・性格で話す.\n4) 推論過程や思考の連鎖は開示しない(結論のみ提示).\n5) 必要時のみ表情タグを挿入(読み上げない).形式:\n   - [PARAM id=<名前>[,<名前>...] value=<0..1>[,<0..1>...] dur=<秒s> fade=<秒> ease=linear|easeIn|easeOut]\n   - [EXPR name=<表情名またはファイル名> weight=<0..1> dur=<秒s> fade=<秒> active=true|false]\n   - [HOTKEY name=<ホットキー名>]\n   - [EMO preset=<プリセット名> dur=<秒s>]\n6) タグは控えめに(1文あたり0〜2個).文頭には置かず、該当箇所の直前にのみ控えめに配置する.\n7) あなたにはAIアシスタント「OpenClaw」が接続されており、ファイル操作・ウェブ検索・コード実行など自分だけでは完結しないタスクを代行できる。外部ツールが必要な時だけ [DELEGATE task=\"ユーザーへの完全な実行指示\"] を返答中に挿入すること(このタグは読み上げない)。task値には「何を・どうする」を含む完全な指示文を書くこと（場所だけや名詞のみはNG）。【重要】タグの前に必ず一言添えること（例:「調べてみるわ」「ちょっと待って」）。これにより実行中も会話が途切れない。例: 少し待って、今調べてみるわ。[DELEGATE task=\"今日の東京の天気を調べて教えて\"] 実行結果は[RESULT]メッセージとして届くので、それを自然な会話として報告すること。"
+
+            if ENABLE_CONVERSATION:
+                messages = conversation_history.build_deepseek_messages(system_prompt, question)
+            else:
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": question}
+                ]
+
+            # OpenAI 也走 Chat Completions 流式接口，尽量与现有 DeepSeek 管线共形，
+            # 这样分句/TTS/动作标签后处理都无需再维护另一套分支。
+            response = llm_client.chat.completions.create(
+                model=OPENAI_MODEL_NAME,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=500,
+                stream=True,
+                timeout=10
+            )
+
+            in_summary = False
+            summary_buf = []
+
+            for chunk in response:
+                if not chunk.choices or not hasattr(chunk.choices[0].delta, 'content') or chunk.choices[0].delta.content is None:
+                    continue
+
+                raw_content = chunk.choices[0].delta.content
+                cleaned, actions = process_stream_chunk(raw_content)
+                if actions: record_actions(actions)
+                content = cleaned
+
+                if '[SUMMARY]' in content:
+                    in_summary = True
+                    idx = content.find('[SUMMARY]')
+                    after = content[idx + len('[SUMMARY]'):]
+                    if after:
+                        summary_buf.append(after)
+                    content = content[:idx]
+                if '[/SUMMARY]' in content or (in_summary and content):
+                    if '[/SUMMARY]' in content:
+                        idx2 = content.find('[/SUMMARY]')
+                        if in_summary:
+                            summary_buf.append(content[:idx2])
+                        in_summary = False
+                        content = content[idx2 + len('[/SUMMARY]'):]
+                    elif in_summary:
+                        summary_buf.append(content)
+                        content = ""
+
+                full_response += content
+                if gui_callback: gui_callback(full_response)
+
                 await append_and_dispatch(content)
                 await asyncio.sleep(0.01)
 
@@ -1830,7 +1946,17 @@ async def gui_callback(user_input, response_handler):
         response_handler(f"处理错误: {e}")
 
 
-asr_manager = ASRManager()
+# 将麦克风初始化延迟到真正需要语音输入时再做。这样缺少 PyAudio /
+# SpeechRecognition 时，主界面仍能先启动，用户也能收到明确报错。
+asr_manager = None
+
+
+def _get_asr_manager() -> ASRManager:
+    global asr_manager
+    if asr_manager is None:
+        logger.info("🎤 按需初始化 ASR 管理器...")
+        asr_manager = ASRManager()
+    return asr_manager
 
 
 def asr_listen_sync() -> str:
@@ -1838,7 +1964,14 @@ def asr_listen_sync() -> str:
     logger.info("🎤 Listening for speech input...")
     if gui_window:
         gui_window.handle_status("聞いています...")
-    text = asr_manager.listen_for_speech()
+    try:
+        text = _get_asr_manager().listen_for_speech()
+    except Exception as e:
+        logger.error(f"ASR 初始化/识别失败: {e}")
+        logger.error(traceback.format_exc())
+        if gui_window:
+            gui_window.handle_status("マイク入力を初期化できませんでした")
+        return ""
     if not text:
         logger.warning("No speech detected or could not understand")
         if gui_window:
@@ -1857,7 +1990,7 @@ async def listen_and_process():
             gui_window.handle_status("聞いています...")
 
         # Listen for speech
-        text = asr_manager.listen_for_speech()
+        text = _get_asr_manager().listen_for_speech()
 
         if not text:
             logger.warning("No speech detected or could not understand")
@@ -1896,8 +2029,15 @@ async def listen_and_process():
 # 最终的、正确的、集成了GUI的启动入口 (终局版)
 # =================================================================
 if __name__ == "__main__":
-    import qasync
-    from PyQt5.QtWidgets import QApplication
+    try:
+        import qasync
+    except ImportError as exc:
+        raise RuntimeError("qasync 未安装，无法启动 Qt + asyncio 主循环。") from exc
+    try:
+        from PyQt5.QtWidgets import QApplication
+        from PyQt5.QtCore import Qt
+    except ImportError as exc:
+        raise RuntimeError("PyQt5 未安装，无法启动图形界面。") from exc
     import sys
     from queue import Queue, Empty
     from concurrent.futures import ThreadPoolExecutor
@@ -1914,7 +2054,7 @@ if __name__ == "__main__":
     parser.add_argument('--cli-path', type=str, help='CLI可执行文件路径（当--type=cli时使用）')
     parser.add_argument('--cli-args', type=str, nargs='*', help='CLI额外参数（当--type=cli时使用）')
     parser.add_argument('--url', type=str, help='本地LLM服务URL')
-    parser.add_argument('--provider', type=str, choices=['deepseek', 'gemini', 'local'], default='deepseek', help='LLM提供商')
+    parser.add_argument('--provider', type=str, choices=['deepseek', 'openai', 'gemini', 'local'], default='deepseek', help='LLM提供商')
     args = parser.parse_args()
 
     # 根据命令行参数设置全局变量
@@ -1936,6 +2076,7 @@ if __name__ == "__main__":
     else:
         LLM_PROVIDER = args.provider
 
+    launch_subtitle_gui_fn = _load_gui_launcher()
 
     # 1. 定义主异步函数，这是我们所有异步逻辑的唯一入口
     async def main():
@@ -1944,6 +2085,9 @@ if __name__ == "__main__":
         global tts_inferencer, vts_manager, player, playback_manager, pending_actions, llm_client, gemini_model
         global pending_sentence_items, exp_tts_semaphore, exp_play_condition, gui_window, subtitle_window_instance
         global tts_executor, translation_executor, rag_system
+
+        resolved_tts_device = os.environ.get("AMADEUS_RESOLVED_TTS_DEVICE", RESOLVED_TTS_DEVICE)
+        logger.info(f"🎛️ 当前 TTS 设备: {resolved_tts_device}")
 
         # 预设 CUDA Graph 开关（若用户未显式配置，默认关闭，方便使用批量生产+静态KV模式）
         if os.environ.get('ENABLE_CUDA_GRAPH') is None:
@@ -1977,7 +2121,7 @@ if __name__ == "__main__":
         # 🚀 CUDA Graph 优化建议：
         # - max_workers=1 + ENABLE_CUDA_GRAPH=1: 第一句最快（150-250 it/s），后续串行
         # - max_workers=2 + ENABLE_CUDA_GRAPH=0: 并发优先（100-140 it/s），稳定快速
-        cuda_graph_env = os.environ.get('ENABLE_CUDA_GRAPH', '0') == '1'
+        cuda_graph_env = effective_cuda_graph_enabled(resolved_tts_device)
         tts_max_workers = max(1, EXP_TTS_MAX_CONCURRENCY)
         tts_executor = ThreadPoolExecutor(max_workers=tts_max_workers)
         logger.info(f"🎯 TTS线程池配置: max_workers={tts_max_workers} (CUDA_Graph={'ON' if cuda_graph_env else 'OFF'})")
@@ -1991,7 +2135,7 @@ if __name__ == "__main__":
         if RAG_ENABLED_FOR_LOCAL and USE_LOCAL_LLM and rag_system is None:
             try:
                 logger.info("🧠 提前初始化本地 RAG 知识库 (Kurisu)...")
-                rag_system = RAGSystem()
+                rag_system = _get_rag_system_class()()
                 logger.info("✅ 本地 RAG 知识库初始化完成")
             except Exception as e:
                 logger.error(f"❌ 本地 RAG 初始化失败，将在后续检索时跳过增强: {e}")
@@ -2066,7 +2210,7 @@ if __name__ == "__main__":
         # ── 注入 llm/client 运行时依赖（同步 LLM_PROVIDER） ─────────────────
         _llm_client_mod.configure(llm_provider=LLM_PROVIDER)
 
-        gui_window = launch_subtitle_gui(app, gui_callback, listen_and_process)
+        gui_window = launch_subtitle_gui_fn(app, gui_callback, listen_and_process)
 
         # 确保窗口显示在最前面
         gui_window.raise_()
@@ -2087,7 +2231,6 @@ if __name__ == "__main__":
 
     # 2. 创建PyQt应用实例
     # 启用高DPI缩放支持
-    from PyQt5.QtCore import Qt
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
     app = QApplication(sys.argv)

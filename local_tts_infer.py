@@ -10,6 +10,7 @@ from pathlib import Path
 import string
 from string import punctuation
 
+from core.runtime_compat import configure_torch_runtime, should_use_half_precision, supports_cuda_graph
 
 # 设置日志记录
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -57,7 +58,7 @@ except ImportError as e:
 
 class TTSInferencer:
     def __init__(self,
-                 device="cuda",
+                 device="auto",
                  gpt_path=None,
                  sovits_path=None,
                  bert_path=None,
@@ -67,7 +68,7 @@ class TTSInferencer:
         初始化TTS推理器
 
         Args:
-            device: 推理设备，默认为"cuda"
+            device: 推理设备，默认为"auto"
             gpt_path: GPT模型路径，如果为None则使用默认路径
             sovits_path: SoVITS模型路径，如果为None则使用默认路径
             bert_path: BERT模型路径，如果为None则使用默认路径
@@ -77,8 +78,10 @@ class TTSInferencer:
         try:
             # 确定模型路径
             base_dir = root_dir
-            self.device = device
-            self.is_half = torch.cuda.is_available() and device == "cuda"
+            # 这里再次走统一设备解析，是为了让 CLI / API 入口和 main.py 保持一致。
+            # Mac 兼容改造后，auto / mps / cpu 的回退策略只维护这一份逻辑。
+            self.device = configure_torch_runtime(device, log=logger)
+            self.is_half = should_use_half_precision(self.device)
 
             # 默认模型路径
             default_gpt_path = os.path.join(base_dir, "GPT_weights_v3", "xxx-e15.ckpt")
@@ -242,6 +245,10 @@ class TTSInferencer:
     def _maybe_precapture_t2s_graph(self):
         """根据环境变量可选地预捕获 T2S 阶段的 CUDA Graph"""
         try:
+            # 预捕获逻辑只在 CUDA 主机上有意义；提前返回可以避免 Mac / CPU
+            # 路径在这里浪费时间做一轮无效检查。
+            if not supports_cuda_graph(self.device):
+                return
             enable_precapture = os.environ.get("ENABLE_CUDA_GRAPH_PRECAPTURE", "1") == "1"
             decoder = getattr(self.t2s_model, "model", None)
             if not enable_precapture or decoder is None:

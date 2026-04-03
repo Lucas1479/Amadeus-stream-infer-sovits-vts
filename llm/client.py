@@ -20,6 +20,7 @@ import google.generativeai as google_genai
 from config.settings import (
     DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL,
     GEMINI_API_KEY, GEMINI_MODEL_NAME,
+    OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL_NAME,
     AWS_BEDROCK_BEARER_TOKEN, AWS_BEDROCK_REGION,
     AWS_BEDROCK_MODEL_ID, AWS_BEDROCK_USE_INFERENCE_PROFILE,
     AWS_BEDROCK_INFERENCE_PROFILE_ID, AWS_BEDROCK_ENDPOINT,
@@ -74,6 +75,25 @@ def init_llm_client():
             http_client=http_client,
         )
         logger.info("🚀 DeepSeek客户端已配置连接池，SSL握手延迟将显著减少")
+        return llm_client
+
+    elif LLM_PROVIDER == "openai":
+        logger.info("Initializing OpenAI LLM client")
+        import httpx
+        http_client = httpx.Client(
+            limits=httpx.Limits(
+                max_connections=10,
+                max_keepalive_connections=5,
+                keepalive_expiry=30.0,
+            ),
+            timeout=httpx.Timeout(30.0),
+            http2=False,
+        )
+        llm_client = OpenAI(
+            api_key=OPENAI_API_KEY,
+            base_url=OPENAI_BASE_URL,
+            http_client=http_client,
+        )
         return llm_client
 
     elif LLM_PROVIDER == "gemini":
@@ -184,6 +204,8 @@ def remote_llm_query(question: str) -> str:
     try:
         if LLM_PROVIDER == "deepseek" and llm_client is None:
             llm_client = init_llm_client()
+        elif LLM_PROVIDER == "openai" and llm_client is None:
+            llm_client = init_llm_client()
         elif LLM_PROVIDER == "gemini" and gemini_model is None:
             gemini_model = init_llm_client()
         elif LLM_PROVIDER == "bedrock":
@@ -207,6 +229,24 @@ def remote_llm_query(question: str) -> str:
             if not response or not hasattr(response, "choices") or not response.choices:
                 logger.warning("⚠️ DeepSeek API returned invalid response")
                 return "APIからの応答が無効です."
+            reply = response.choices[0].message.content
+
+        elif LLM_PROVIDER == "openai":
+            # 直接复用 Chat Completions 形状，减少对现有上下文构造与错误处理的改动面。
+            response = llm_client.chat.completions.create(
+                model=OPENAI_MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT_BASE},
+                    {"role": "user", "content": question},
+                ],
+                temperature=0.7,
+                max_tokens=500,
+                stream=False,
+                timeout=10,
+            )
+            if not response or not hasattr(response, "choices") or not response.choices:
+                logger.warning("⚠️ OpenAI API returned invalid response")
+                return "OpenAI APIからの応答が無効です."
             reply = response.choices[0].message.content
 
         # ── Gemini ────────────────────────────────────────────────────────────

@@ -16,13 +16,29 @@ from dataclasses import dataclass, field
 from typing import Callable, Coroutine, Any
 
 import numpy as np
-import pyaudio
 import torch
+
+try:
+    import pyaudio
+except ImportError as exc:
+    pyaudio = None
+    _PYAUDIO_IMPORT_ERROR = exc
+else:
+    _PYAUDIO_IMPORT_ERROR = None
 
 from tools.text_utils import _parse_sentence_seq
 from config.settings import USE_FIRST_SENTENCE_SPRINT
 
 logger = logging.getLogger(__name__)
+
+
+def _require_pyaudio() -> None:
+    # 播放模块允许被导入，但真正开始播放时必须明确告诉用户缺少了
+    # 哪个依赖，否则主程序会在导入阶段直接因为 `import pyaudio` 崩掉。
+    if pyaudio is None:
+        raise RuntimeError(
+            "PyAudio 未安装，无法播放实时语音。macOS 需要先安装 portaudio，再重新安装 pyaudio。"
+        ) from _PYAUDIO_IMPORT_ERROR
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +81,7 @@ class StreamPlayer:
         self.last_send_time = 0
 
     def initialize(self, sample_rate: int) -> None:
+        _require_pyaudio()
         if self.pyaudio_instance is None:
             self.pyaudio_instance = pyaudio.PyAudio()
 

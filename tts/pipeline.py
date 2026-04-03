@@ -24,9 +24,12 @@ import numpy as np
 
 from config.settings import (
     SEGMENT_CHAR_LIMIT,
+    TTS_REF_AUDIO_PATH,
+    TTS_REF_TEXT,
     USE_EXPERIMENTAL_TTS_STREAM,
     USE_FIRST_SENTENCE_SPRINT,
 )
+from core.runtime_compat import effective_cuda_graph_enabled, get_tts_mode_label, supports_cuda_graph
 from tools.text_utils import (
     _compute_text_sha1,
     _parse_sentence_seq,
@@ -60,10 +63,15 @@ def reconfigure_tts_mode(cuda_graph: bool, concurrency: int) -> None:
     """
     global _exp_tts_semaphore
     import os
+    # GUI 在所有平台都展示同一组选项，但非 CUDA 主机并不支持 CUDA Graph。
+    # 这里统一钳制为普通并行模式，避免用户切到一个“看起来开启、实际上无效”的状态。
+    if cuda_graph and not supports_cuda_graph():
+        logger.info("[TTS Mode] 当前平台不支持 CUDA Graph，已自动回退到 Parallel ×2。")
+        cuda_graph = False
     os.environ['ENABLE_CUDA_GRAPH'] = '1' if cuda_graph else '0'
     _exp_tts_semaphore = asyncio.Semaphore(concurrency)
     logger.info(
-        f"[TTS Mode] 已切换 → CUDA_Graph={'ON' if cuda_graph else 'OFF'}, "
+        f"[TTS Mode] 已切换 → mode={get_tts_mode_label(cuda_graph)}, "
         f"semaphore={concurrency}"
     )
 
@@ -109,7 +117,7 @@ def get_sovits_params(text: str, is_first_sentence: bool = False):
     CUDA Graph 开关仅由环境变量 ENABLE_CUDA_GRAPH 控制，静态 KV Cache 始终开启。
     """
     length = len(text.strip())
-    cuda_graph_env = os.environ.get("ENABLE_CUDA_GRAPH", "0") == "1"
+    cuda_graph_env = effective_cuda_graph_enabled()
 
     if is_first_sentence:
         max_sec_override = max(3.5, min(8.0, length * 0.25 or 3.5))
@@ -168,14 +176,23 @@ def get_sovits_params(text: str, is_first_sentence: bool = False):
 # 合成策略
 # =============================================================================
 
-_REF_AUDIO = "./reference audio/kurisu_reference.wav"
-_REF_TEXT = "そういえば,正式に自己紹介していませんでしたね……牧瀬紅莉栖です.改めてまして,よろしく"
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 参考音频改为走 .env，可让用户直接替换自己的样音，而不用再改源码里的固定路径。
+_REF_AUDIO = (
+    TTS_REF_AUDIO_PATH
+    if os.path.isabs(TTS_REF_AUDIO_PATH)
+    else os.path.join(_ROOT_DIR, TTS_REF_AUDIO_PATH)
+)
+_REF_TEXT = TTS_REF_TEXT
 
 
 async def generate_segment_improved(text_segment):
     """改进的分段生成函数（本地推理），增加性能监控和错误处理。"""
     if _tts_inferencer is None:
         logger.error("TTS推理器未初始化，无法生成语音")
+        return np.zeros(16000, dtype=np.float32), 16000
+    if not os.path.exists(_REF_AUDIO):
+        logger.error("参考音频不存在: %s。请在 .env 中填写 TTS_REF_AUDIO_PATH。", _REF_AUDIO)
         return np.zeros(16000, dtype=np.float32), 16000
 
     params = get_sovits_params(text_segment)

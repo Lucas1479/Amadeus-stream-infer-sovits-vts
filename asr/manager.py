@@ -7,10 +7,36 @@ from __future__ import annotations
 import logging
 import traceback
 
-import pyaudio
-import speech_recognition as speech_rec
+try:
+    import pyaudio
+except ImportError as exc:
+    pyaudio = None
+    _PYAUDIO_IMPORT_ERROR = exc
+else:
+    _PYAUDIO_IMPORT_ERROR = None
+
+try:
+    import speech_recognition as speech_rec
+except ImportError as exc:
+    speech_rec = None
+    _SPEECH_RECOGNITION_IMPORT_ERROR = exc
+else:
+    _SPEECH_RECOGNITION_IMPORT_ERROR = None
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_asr_dependencies() -> None:
+    # 这里不在模块导入阶段直接抛错，是为了让主程序可以先启动并给出
+    # 更友好的报错；真正点击麦克风或初始化 ASR 时再提示缺什么。
+    if pyaudio is None:
+        raise RuntimeError(
+            "PyAudio 未安装，无法启用麦克风输入。macOS 需要先安装 portaudio，再重新安装 pyaudio。"
+        ) from _PYAUDIO_IMPORT_ERROR
+    if speech_rec is None:
+        raise RuntimeError(
+            "SpeechRecognition 未安装，无法启用麦克风输入。"
+        ) from _SPEECH_RECOGNITION_IMPORT_ERROR
 
 
 class ASRManager:
@@ -18,6 +44,7 @@ class ASRManager:
     MICROPHONE_DEVICE_INDEX = 2
 
     def __init__(self):
+        _ensure_asr_dependencies()
         self.logger = logging.getLogger("asr_manager")
         self._init_google_asr()
 
@@ -170,6 +197,7 @@ class ASRManager:
 
     def set_microphone_index(self, index: int | None) -> None:
         """手动切换麦克风设备索引，传 None 恢复自动选择。"""
+        _ensure_asr_dependencies()
         ASRManager.MICROPHONE_DEVICE_INDEX = index
         names = speech_rec.Microphone.list_microphone_names()
         name = names[index] if index is not None and index < len(names) else "系统默认"

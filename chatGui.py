@@ -17,6 +17,7 @@ from qfluentwidgets import (FluentWindow, NavigationItemPosition, SubtitleLabel,
                             LineEdit, Action, RoundMenu, PushSettingCard,
                             OptionsConfigItem, OptionsValidator, ConfigItem, BoolValidator,
                             setThemeColor, ComboBox)
+from core.runtime_compat import effective_cuda_graph_enabled, get_tts_mode_label
 
 def get_main_module():
     # 直接运行 python main.py 时，主模块注册为 '__main__' 而非 'main'
@@ -286,8 +287,8 @@ class ChatInterface(QWidget):
                 self.provider_combo.blockSignals(True)
                 self.provider_combo.setCurrentIndex(idx)
                 self.provider_combo.blockSignals(False)
-        cuda_graph_on = os.environ.get('ENABLE_CUDA_GRAPH', '0') == '1'
-        tts_text = "CUDA Graph ×1" if cuda_graph_on else "Parallel ×2"
+        cuda_graph_on = effective_cuda_graph_enabled()
+        tts_text = get_tts_mode_label(cuda_graph_on)
         idx = self.tts_mode_combo.findText(tts_text)
         if idx >= 0:
             self.tts_mode_combo.blockSignals(True)
@@ -802,9 +803,8 @@ class SettingInterface(ScrollArea):
             self.convCard.setChecked(getattr(main_module, 'ENABLE_CONVERSATION', True))
             self.sprintCard.setChecked(getattr(main_module, 'FIRST_SENTENCE_SPRINT', True))
             self.subtitleCard.setChecked(getattr(main_module, 'SHOW_SUBTITLE_WINDOW', False))
-            import os
-            cuda_graph_on = os.environ.get('ENABLE_CUDA_GRAPH', '0') == '1'
-            self.ttsModeCard.setValue("CUDA Graph ×1" if cuda_graph_on else "Parallel ×2")
+            cuda_graph_on = effective_cuda_graph_enabled()
+            self.ttsModeCard.setValue(get_tts_mode_label(cuda_graph_on))
 
             self._update_visibility()
 

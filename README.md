@@ -166,12 +166,23 @@ User Input (voice / text)
 
 ### Requirements
 
-- Python 3.10+
+- Python 3.10.x recommended
 - NVIDIA GPU (CUDA 11.8+ or 12.x, RTX 3060 or above recommended)
+- macOS / Apple Silicon: experimental compatibility path, CPU is the default runtime; MPS is opt-in
 - [VTuber Studio](https://denchisoft.com/) (optional — lip-sync & expressions)
 - [OpenClaw](https://github.com/your-openclaw-repo) (optional — tool use)
 
 ### Installation
+
+**macOS (experimental)**
+
+```bash
+conda create -n amadeus-mac python=3.10 -y
+conda activate amadeus-mac
+bash install.sh
+```
+
+On Apple Silicon, `TTS_DEVICE=auto` currently defaults to CPU for stability. Set `TTS_DEVICE=mps` only if you want to test the Metal path explicitly.
 
 **1. Install PyTorch**
 
@@ -199,6 +210,7 @@ Key settings:
 
 ```env
 DEEPSEEK_API_KEY=sk-...          # or GEMINI_API_KEY=AIza...
+TTS_DEVICE=auto                  # Apple Silicon defaults to CPU in auto mode
 TTS_GPT_MODEL_PATH=GPT_weights_v3/your-model.ckpt
 TTS_SOVITS_MODEL_PATH=SoVITS_weights_v3/your-model.pth
 VTS_WS_URL=ws://127.0.0.1:8001
@@ -417,12 +429,23 @@ LLM 输出: "少し待って。[DELEGATE task="今日の天気を調べて"] 調
 
 ### 环境要求
 
-- Python 3.10+
+- 推荐 Python 3.10.x
 - NVIDIA GPU（CUDA 11.8+ 或 12.x，推荐 RTX 3060 及以上）
+- macOS / Apple Silicon：实验性兼容路径，默认走 CPU；MPS 作为显式可选项保留
 - [VTuber Studio](https://denchisoft.com/)（可选，口型 / 表情同步）
 - [OpenClaw](https://github.com/your-openclaw-repo)（可选，工具调用）
 
 ### 安装
+
+**macOS（实验支持）**
+
+```bash
+conda create -n amadeus-mac python=3.10 -y
+conda activate amadeus-mac
+bash install.sh
+```
+
+在 Apple Silicon 上，`TTS_DEVICE=auto` 目前默认选择 CPU 以优先保证稳定性；只有在你明确想测试 Metal 路径时再手动改成 `TTS_DEVICE=mps`。
 
 **1. 安装 PyTorch**
 
@@ -450,6 +473,7 @@ cp .env.example .env
 
 ```env
 DEEPSEEK_API_KEY=sk-...          # 或 GEMINI_API_KEY=AIza...
+TTS_DEVICE=auto                  # Apple Silicon 在 auto 模式下默认走 CPU
 TTS_GPT_MODEL_PATH=GPT_weights_v3/your-model.ckpt
 TTS_SOVITS_MODEL_PATH=SoVITS_weights_v3/your-model.pth
 VTS_WS_URL=ws://127.0.0.1:8001
