@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 
 
 class ASRManager:
-    # 可在此处强制指定麦克风设备索引（None = 自动选择）
-    MICROPHONE_DEVICE_INDEX = 2
+    # 可在此处强制指定麦克风设备索引（None = 自动选择 RMS 最高设备）
+    MICROPHONE_DEVICE_INDEX = None
 
     def __init__(self):
         self.logger = logging.getLogger("asr_manager")
@@ -34,39 +34,53 @@ class ASRManager:
         device_count = pa.get_device_count()
         names = speech_rec.Microphone.list_microphone_names()
 
+        import audioop
         print(f"[ASR] ===== 可用音频输入设备 ({device_count} 个) =====")
         best_index = None
         best_rms = -1
 
+        # 虚拟/映射设备名单：能打开但不录音，排在末位
+        _VIRTUAL_NAMES = ("sound mapper", "primary sound", "Microsoft Sound Mapper", "Primary Sound")
+
         for i in range(device_count):
             try:
                 info = pa.get_device_info_by_index(i)
-                if info.get("maxInputChannels", 0) <= 0:
+                max_ch = int(info.get("maxInputChannels", 0))
+                if max_ch <= 0:
                     continue
                 dev_name = names[i] if i < len(names) else info.get("name", f"Device {i}")
 
-                try:
-                    stream = pa.open(
-                        format=pyaudio.paInt16,
-                        channels=1,
-                        rate=int(info.get("defaultSampleRate", 16000)),
-                        input=True,
-                        input_device_index=i,
-                        frames_per_buffer=1024,
-                    )
-                    import audioop
-                    frames = b""
-                    for _ in range(4):
-                        frames += stream.read(1024, exception_on_overflow=False)
-                    stream.stop_stream()
-                    stream.close()
-                    rms = audioop.rms(frames, 2)
-                except Exception:
-                    rms = -1
+                # 用设备原生通道数测试（先尝试1ch，若失败再用原生通道数）
+                rms = -1
+                for test_ch in ([1, max_ch] if max_ch > 1 else [1]):
+                    try:
+                        stream = pa.open(
+                            format=pyaudio.paInt16,
+                            channels=test_ch,
+                            rate=int(info.get("defaultSampleRate", 16000)),
+                            input=True,
+                            input_device_index=i,
+                            frames_per_buffer=1024,
+                        )
+                        frames = b""
+                        for _ in range(4):
+                            frames += stream.read(1024, exception_on_overflow=False)
+                        stream.stop_stream()
+                        stream.close()
+                        raw_rms = audioop.rms(frames, 2)
+                        # 多通道时取每通道平均（避免多通道能量虚高）
+                        rms = raw_rms // test_ch
+                        break  # 成功则不再尝试其他通道数
+                    except Exception:
+                        continue
 
-                print(f"[ASR]   [{i}] {dev_name}  RMS={rms}")
-                if rms > best_rms:
-                    best_rms = rms
+                # 虚拟/映射设备 RMS 强制降权（即使能打开也不优先）
+                is_virtual = any(v.lower() in dev_name.lower() for v in _VIRTUAL_NAMES)
+                effective_rms = rms if not is_virtual else min(rms, 0)
+
+                print(f"[ASR]   [{i}] {dev_name}  RMS={rms}{'(virtual)' if is_virtual else ''}")
+                if effective_rms > best_rms:
+                    best_rms = effective_rms
                     best_index = i
             except Exception:
                 pass
@@ -75,7 +89,7 @@ class ASRManager:
 
         if best_index is not None:
             name = names[best_index] if best_index < len(names) else best_index
-            print(f"[ASR] 自动选择 RMS 最高的设备 [{best_index}]: {name}  (RMS={best_rms})")
+            print(f"[ASR] 自动选择设备 [{best_index}]: {name}  (RMS={best_rms})")
         else:
             print("[ASR] 未找到可用输入设备，将使用系统默认")
         return best_index
@@ -89,6 +103,10 @@ class ASRManager:
         self.recognizer.operation_timeout = 30
 
         mic_index = self._pick_microphone_index()
+        # 将检测到的设备索引写回类变量，让 VAD / sidecar 也能用同一个设备
+        if mic_index is not None and ASRManager.MICROPHONE_DEVICE_INDEX is None:
+            ASRManager.MICROPHONE_DEVICE_INDEX = mic_index
+            print(f"[ASR] 自动检测麦克风: 已将设备[{mic_index}]写回 MICROPHONE_DEVICE_INDEX")
 
         for idx in ([mic_index] if mic_index is not None else []) + [None]:
             try:
