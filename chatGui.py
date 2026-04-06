@@ -5,7 +5,7 @@ import threading
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QTextEdit, QLabel, QScrollArea, QFrame, QSizePolicy,
                              QListWidget, QListWidgetItem, QMenu, QAction, QInputDialog,
-                             QPushButton, QDesktopWidget)
+                             QPushButton, QDesktopWidget, QDoubleSpinBox, QCheckBox, QSlider)
 from PyQt5.QtCore import Qt, pyqtSignal, QSize, QObject, QTimer
 from PyQt5.QtGui import QIcon, QFont, QColor, QCursor
 
@@ -159,108 +159,232 @@ class ChatInputBar(QFrame):
             self.text_input.clear()
 
 class ChatInterface(QWidget):
+    _PANEL_W = 420  # 聊天面板宽度
+
     def __init__(self, send_callback, asr_callback, parent=None):
         super().__init__(parent=parent)
         self.setObjectName("ChatInterface")
         self.send_callback = send_callback
         self.asr_callback = asr_callback
-        
         self.last_assistant_bubble = None
+        self._render_engine = None
+        self._panel_expanded = True
+        self._render_mode = "vts"   # "vts" | "pixi"
         self.init_ui()
 
     def init_ui(self):
-        self.main_layout = QHBoxLayout(self)
-        self.main_layout.setContentsMargins(0, 0, 0, 0)
-        self.main_layout.setSpacing(0)
-        
-        # Left Sidebar for Sessions
-        self.sidebar = QFrame(self)
-        self.sidebar.setFixedWidth(250)
-        self.sidebar.setStyleSheet("background-color: #FAFAFA; border-right: 1px solid #E0E0E0;")
-        self.sidebar_layout = QVBoxLayout(self.sidebar)
-        
-        self.new_chat_btn = PrimaryPushButton(FIF.ADD, "New Chat", self.sidebar)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── 左侧：角色背景区 ───────────────────────────────────────────────────
+        self._char_container = QWidget(self)
+        self._char_container.setStyleSheet("background: #1e1e1e;")
+        self._char_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        char_layout = QVBoxLayout(self._char_container)
+        char_layout.setContentsMargins(0, 0, 0, 0)
+        self._char_container.hide()   # 默认 VTS 模式，角色区折叠
+        root.addWidget(self._char_container, 1)
+
+        # ── 右侧：聊天面板 ────────────────────────────────────────────────────
+        self._chat_panel = QFrame(self)
+        # VTS 模式下不限制宽度，Pixi 模式下固定为 _PANEL_W
+        self._chat_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._chat_panel.setStyleSheet(
+            "QFrame#chatPanel { background-color: rgba(248,248,248,230); "
+            "border-left: 1px solid #ddd; }"
+        )
+        self._chat_panel.setObjectName("chatPanel")
+        panel_layout = QVBoxLayout(self._chat_panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(0)
+
+        # ── 面板头部（model bar + 折叠按钮，始终可见）──────────────────────────
+        self.model_bar = QFrame(self._chat_panel)
+        self.model_bar.setFixedHeight(44)
+        self.model_bar.setStyleSheet(
+            "QFrame { background-color: #F5F5F5; border-bottom: 1px solid #E0E0E0; }"
+        )
+        mb = QHBoxLayout(self.model_bar)
+        mb.setContentsMargins(8, 0, 12, 0)
+        mb.setSpacing(8)
+
+        self._toggle_btn = TransparentToolButton(FIF.LEFT_ARROW, self.model_bar)
+        self._toggle_btn.setToolTip("折叠历史记录")
+        self._toggle_btn.clicked.connect(self._toggle_panel)
+        mb.addWidget(self._toggle_btn)
+
+        sep0 = QFrame(self.model_bar)
+        sep0.setFrameShape(QFrame.VLine)
+        sep0.setStyleSheet("background:#D0D0D0; border:none;")
+        sep0.setFixedWidth(1)
+        mb.addWidget(sep0)
+
+        lbl_provider = QLabel("Model:", self.model_bar)
+        lbl_provider.setStyleSheet("font-size:12px; color:#444; background:transparent; border:none;")
+        self.provider_combo = ComboBox(self.model_bar)
+        self.provider_combo.addItems(["deepseek", "gemini", "bedrock", "local"])
+        self.provider_combo.setFixedWidth(110)
+        self.provider_combo.currentTextChanged.connect(self._on_bar_provider_changed)
+
+        sep1 = QFrame(self.model_bar)
+        sep1.setFrameShape(QFrame.VLine)
+        sep1.setStyleSheet("background:#D0D0D0; border:none;")
+        sep1.setFixedWidth(1)
+
+        lbl_tts = QLabel("TTS:", self.model_bar)
+        lbl_tts.setStyleSheet("font-size:12px; color:#444; background:transparent; border:none;")
+        self.tts_mode_combo = ComboBox(self.model_bar)
+        self.tts_mode_combo.addItems(["Parallel ×2", "CUDA Graph ×1"])
+        self.tts_mode_combo.setFixedWidth(140)
+        self.tts_mode_combo.currentTextChanged.connect(self._on_bar_tts_mode_changed)
+
+        mb.addWidget(lbl_provider)
+        mb.addWidget(self.provider_combo)
+        mb.addWidget(sep1)
+        mb.addWidget(lbl_tts)
+        mb.addWidget(self.tts_mode_combo)
+        mb.addStretch(1)
+
+        sep2 = QFrame(self.model_bar)
+        sep2.setFrameShape(QFrame.VLine)
+        sep2.setStyleSheet("background:#D0D0D0; border:none;")
+        sep2.setFixedWidth(1)
+        mb.addWidget(sep2)
+
+        self._render_mode_btn = TransparentToolButton(FIF.VIDEO, self.model_bar)
+        self._render_mode_btn.setToolTip("切换到角色渲染视图 (PixiJS)")
+        self._render_mode_btn.clicked.connect(self._toggle_render_mode)
+        mb.addWidget(self._render_mode_btn)
+
+        panel_layout.addWidget(self.model_bar)
+
+        # ── 历史区（可折叠）──────────────────────────────────────────────────
+        self._history_area = QWidget(self._chat_panel)
+        hist_layout = QVBoxLayout(self._history_area)
+        hist_layout.setContentsMargins(0, 0, 0, 0)
+        hist_layout.setSpacing(0)
+
+        # Session bar
+        sess_bar = QWidget(self._history_area)
+        sess_bar.setStyleSheet("background:#FAFAFA; border-bottom:1px solid #E8E8E8;")
+        sb_layout = QHBoxLayout(sess_bar)
+        sb_layout.setContentsMargins(8, 4, 8, 4)
+        sb_layout.setSpacing(6)
+        self.new_chat_btn = PrimaryPushButton(FIF.ADD, "New Chat", sess_bar)
         self.new_chat_btn.clicked.connect(self._on_new_chat)
-        self.sidebar_layout.addWidget(self.new_chat_btn)
-        
-        self.session_list = QListWidget(self.sidebar)
-        self.session_list.setStyleSheet("QListWidget { border: none; background: transparent; } QListWidget::item { padding: 10px; border-radius: 5px; } QListWidget::item:selected { background-color: #EAEAEA; }")
+        sb_layout.addWidget(self.new_chat_btn)
+        sb_layout.addStretch(1)
+        hist_layout.addWidget(sess_bar)
+
+        self.session_list = QListWidget(self._history_area)
+        self.session_list.setMaximumHeight(140)
+        self.session_list.setStyleSheet(
+            "QListWidget { border:none; background:#FAFAFA; }"
+            "QListWidget::item { padding:7px 10px; border-radius:4px; }"
+            "QListWidget::item:selected { background:#EAEAEA; }"
+        )
         self.session_list.itemClicked.connect(self._on_session_selected)
         self.session_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.session_list.customContextMenuRequested.connect(self._on_session_context_menu)
-        self.sidebar_layout.addWidget(self.session_list)
-        
-        self.main_layout.addWidget(self.sidebar)
-        
-        # Right Chat Area
-        self.chat_area = QWidget(self)
-        self.chat_layout = QVBoxLayout(self.chat_area)
-        self.chat_layout.setContentsMargins(20, 20, 20, 20)
-        
-        # ── Model Bar ──────────────────────────────────────────────────────────
-        self.model_bar = QFrame(self.chat_area)
-        self.model_bar.setFixedHeight(44)
-        self.model_bar.setStyleSheet(
-            "QFrame { background-color: #F5F5F5; border-bottom: 1px solid #E0E0E0; "
-            "border-radius: 0px; }"
-        )
-        mb_layout = QHBoxLayout(self.model_bar)
-        mb_layout.setContentsMargins(16, 0, 16, 0)
-        mb_layout.setSpacing(16)
+        hist_layout.addWidget(self.session_list)
 
-        # LLM Provider
-        lbl_provider = QLabel("🤖 Model:", self.model_bar)
-        lbl_provider.setStyleSheet("font-size: 13px; color: #333; background: transparent; border: none;")
-        self.provider_combo = ComboBox(self.model_bar)
-        self.provider_combo.addItems(["deepseek", "gemini", "bedrock", "local"])
-        self.provider_combo.setFixedWidth(120)
-        self.provider_combo.currentTextChanged.connect(self._on_bar_provider_changed)
-
-        # Separator
-        sep = QFrame(self.model_bar)
-        sep.setFrameShape(QFrame.VLine)
-        sep.setStyleSheet("color: #D0D0D0; border: none; background: #D0D0D0;")
-        sep.setFixedWidth(1)
-
-        # TTS Mode
-        lbl_tts = QLabel("🔊 TTS:", self.model_bar)
-        lbl_tts.setStyleSheet("font-size: 13px; color: #333; background: transparent; border: none;")
-        self.tts_mode_combo = ComboBox(self.model_bar)
-        self.tts_mode_combo.addItems(["Parallel ×2", "CUDA Graph ×1"])
-        self.tts_mode_combo.setFixedWidth(150)
-        self.tts_mode_combo.currentTextChanged.connect(self._on_bar_tts_mode_changed)
-
-        mb_layout.addWidget(lbl_provider)
-        mb_layout.addWidget(self.provider_combo)
-        mb_layout.addWidget(sep)
-        mb_layout.addWidget(lbl_tts)
-        mb_layout.addWidget(self.tts_mode_combo)
-        mb_layout.addStretch(1)
-
-        self.chat_layout.addWidget(self.model_bar)
-        # ── End Model Bar ──────────────────────────────────────────────────────
-
-        self.scroll_area = ScrollArea(self.chat_area)
+        self.scroll_area = ScrollArea(self._history_area)
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
-        
+        self.scroll_area.setStyleSheet("QScrollArea { border:none; background:transparent; }")
         self.scroll_widget = QWidget()
-        self.scroll_widget.setStyleSheet("background-color: transparent;")
+        self.scroll_widget.setStyleSheet("background:transparent;")
         self.scroll_layout = QVBoxLayout(self.scroll_widget)
         self.scroll_layout.setAlignment(Qt.AlignTop)
-        self.scroll_layout.setContentsMargins(0, 0, 0, 0)
-        self.scroll_layout.setSpacing(15)
-        
+        self.scroll_layout.setContentsMargins(8, 8, 8, 8)
+        self.scroll_layout.setSpacing(10)
         self.scroll_area.setWidget(self.scroll_widget)
-        self.chat_layout.addWidget(self.scroll_area, 1)
-        
-        self.input_bar = ChatInputBar(self._on_send_text, self._on_mic_clicked, self.chat_area)
-        self.chat_layout.addWidget(self.input_bar)
-        
-        self.main_layout.addWidget(self.chat_area, 1)
-        
+        hist_layout.addWidget(self.scroll_area, 1)
+
+        panel_layout.addWidget(self._history_area, 1)
+
+        # ── 输入栏（始终可见）────────────────────────────────────────────────
+        self.input_bar = ChatInputBar(self._on_send_text, self._on_mic_clicked, self._chat_panel)
+        panel_layout.addWidget(self.input_bar)
+
+        root.addWidget(self._chat_panel, 0)
+
         self.reload_sessions()
         self._sync_model_bar()
+
+    def _init_render_engine(self):
+        """在 ChatInterface 内部启动渲染引擎并嵌入背景区（首次切换到 pixi 模式时懒加载）。"""
+        import os
+        try:
+            from render.engine import RenderEngine
+            engine = RenderEngine()
+            # WebEngine 加载完成后强制 navbar repaint（OpenGL 初始化会使 navbar 变黑）
+            engine.on_ready = lambda: QTimer.singleShot(80, self._force_navbar_repaint)
+            widget = engine.start()
+            self._char_container.layout().addWidget(widget)
+            self._render_engine = engine
+            images_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "render", "assets", "images"
+            )
+            if os.path.isdir(images_dir):
+                engine.load_kur1or3_sprites(images_dir)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"[ChatInterface] 渲染引擎初始化失败: {e}")
+
+    def engine(self):
+        return self._render_engine
+
+    def _toggle_panel(self):
+        self._panel_expanded = not self._panel_expanded
+        self._history_area.setVisible(self._panel_expanded)
+        if self._panel_expanded:
+            self._toggle_btn.setIcon(FIF.LEFT_ARROW)
+            self._toggle_btn.setToolTip("折叠历史记录")
+        else:
+            self._toggle_btn.setIcon(FIF.RIGHT_ARROW)
+            self._toggle_btn.setToolTip("展开历史记录")
+
+    def _toggle_render_mode(self):
+        """在 VTS 渲染 和 PixiJS 角色渲染 之间切换。"""
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+        from vts.expression_controller import get_controller
+        ctrl = get_controller()
+
+        if self._render_mode == "vts":
+            self._render_mode = "pixi"
+            self._char_container.show()
+            self._chat_panel.setFixedWidth(self._PANEL_W)
+            self._render_mode_btn.setIcon(FIF.MOVIE)
+            self._render_mode_btn.setToolTip("切换到 VTS 渲染")
+            # 清除 VTS 当前表情状态（避免 VTS 持续渲染旧表情）
+            ctrl.on_turn_end()
+            # 首次激活时懒加载渲染引擎
+            if self._render_engine is None:
+                self._init_render_engine()
+            # 切换 backend → pixi
+            if self._render_engine is not None:
+                ctrl.set_render_engine(self._render_engine, backend="pixi")
+                _log.info("[ChatInterface] 切换到 PixiJS 渲染模式")
+        else:
+            self._render_mode = "vts"
+            self._char_container.hide()
+            self._chat_panel.setMaximumWidth(16777215)  # 解除固定宽度
+            self._chat_panel.setMinimumWidth(0)
+            self._chat_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self._render_mode_btn.setIcon(FIF.VIDEO)
+            self._render_mode_btn.setToolTip("切换到角色渲染视图 (PixiJS)")
+            # 停止口型动画
+            if self._render_engine is not None:
+                try:
+                    self._render_engine.set_speaking(False)
+                except Exception as _e:
+                    _log.error(f"[ChatInterface] set_speaking(False) 失败: {_e}")
+            # 切换 backend → vts
+            if self._render_engine is not None:
+                ctrl.set_render_engine(self._render_engine, backend="vts")
+                _log.info("[ChatInterface] 切换到 VTS 渲染模式")
 
     def set_live_api_active(self, active: bool):
         """由 SettingInterface 调用，同步 Live API 状态到输入栏。"""
@@ -1052,6 +1176,404 @@ class LiveApiFloatButton(QWidget):
         self._drag_pos = None
 
 
+class VadMonitorWidget(QWidget):
+    """悬浮 VAD 能量监控，仅在 Live API 激活时显示。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(160, 28)
+        self._label = QLabel("🎤 --", self)
+        self._label.setFixedSize(160, 28)
+        self._label.setAlignment(Qt.AlignCenter)
+        self._label.setStyleSheet(
+            "background:#222; color:#aaa; font-size:11px; border-radius:6px; padding:0 6px;"
+        )
+        self._drag_pos = None
+        self._timer = QTimer(self)
+        self._timer.setInterval(120)
+        self._timer.timeout.connect(self._refresh)
+
+        try:
+            geo = QDesktopWidget().availableGeometry()
+            self.move(geo.right() - 180, geo.bottom() - 120)
+        except Exception:
+            self.move(1100, 750)
+
+    def _refresh(self):
+        try:
+            mm = sys.modules.get('multimodal.controller')
+            mgr = getattr(mm, '_mm_manager', None) if mm else None
+            energy = getattr(mgr, '_last_audio_energy', 0.0)
+            state = getattr(mgr, 'state', 'IDLE')
+            speaking = state == 'LISTENING_TO_USER'
+            icon = "🟢" if speaking else "🎤"
+            color = "#4CAF50" if speaking else "#aaa"
+            self._label.setStyleSheet(
+                f"background:#222; color:{color}; font-size:11px; border-radius:6px; padding:0 6px;"
+            )
+            self._label.setText(f"{icon} {int(energy):5d}  {state[:12]}")
+        except Exception:
+            pass
+
+    def set_active(self, active: bool):
+        if active:
+            self.show()
+            self._timer.start()
+        else:
+            self._timer.stop()
+            self.hide()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_pos = e.globalPos() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() == Qt.LeftButton and self._drag_pos is not None:
+            self.move(e.globalPos() - self._drag_pos)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
+
+
+class CharacterInterface(QWidget):
+    """角色渲染界面 — 嵌入 PixiJS 渲染引擎（支持 Live2D 和静态帧两种后端）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("characterInterface")
+        self._engine = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        try:
+            from render.engine import RenderEngine
+            self._engine = RenderEngine()
+            widget = self._engine.start()
+            layout.addWidget(widget)
+            self._auto_load_kur1or3()
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"[CharacterInterface] 渲染引擎初始化失败: {e}")
+            label = QLabel(f"渲染引擎不可用\n{e}", self)
+            label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(label)
+
+    def _auto_load_kur1or3(self):
+        """自动加载 render/assets/images/ 中的 kurisu_*.png。"""
+        import os
+        images_dir = os.path.join(os.path.dirname(__file__), "render", "assets", "images")
+        if os.path.isdir(images_dir):
+            try:
+                self._engine.load_kur1or3_sprites(images_dir)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"[CharacterInterface] 加载 sprite 失败: {e}")
+
+    def engine(self):
+        return self._engine
+
+
+class EmotionPresetsInterface(QWidget):
+    """Emotion preset editor — live read/write emotion_presets.json + hot-reload."""
+
+    # (field_key, display_label, min_float, max_float, step_float)
+    _FIELDS = [
+        ("fade_in_sec",            "Fade In",           0.05, 5.0,   0.05),
+        ("fade_out_sec",           "Fade Out",          0.05, 5.0,   0.05),
+        ("transition_overlap_sec", "Transition Overlap", 0.0,  3.0,   0.05),
+        ("idle_return_delay_sec",  "Idle Return Delay", 0.5,  120.0, 0.5),
+    ]
+    _SLIDER_STYLE = """
+        QSlider::groove:horizontal {
+            height: 4px; background: #E0E0E0; border-radius: 2px;
+        }
+        QSlider::sub-page:horizontal {
+            background: #0078D4; border-radius: 2px;
+        }
+        QSlider::handle:horizontal {
+            width: 16px; height: 16px; margin: -6px 0;
+            background: white; border: 2px solid #0078D4; border-radius: 8px;
+        }
+        QSlider::handle:horizontal:hover { background: #E3F2FD; }
+        QSlider::groove:horizontal:disabled { background: #EBEBEB; }
+        QSlider::sub-page:horizontal:disabled { background: #C8C8C8; }
+        QSlider::handle:horizontal:disabled { border-color: #C8C8C8; }
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent=parent)
+        self.setObjectName("EmotionPresetsInterface")
+        self._current_preset: str | None = None
+        self._data: dict = {}
+        # field → (QSlider, QLabel_value)
+        self._sliders: dict[str, tuple] = {}
+        self._auto_return_chk: QCheckBox | None = None
+        self._init_ui()
+        self._load_presets()
+
+    # ------------------------------------------------------------------
+    # Path & I/O
+    # ------------------------------------------------------------------
+    def _preset_path(self) -> str:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "emotion_presets.json")
+
+    def _load_presets(self):
+        import json
+        try:
+            with open(self._preset_path(), encoding="utf-8") as f:
+                raw = json.load(f)
+            self._data = {k: v for k, v in raw.items() if not k.startswith("_")}
+        except Exception:
+            self._data = {}
+        self._preset_list.clear()
+        for name in self._data:
+            self._preset_list.addItem(name)
+        if self._preset_list.count():
+            self._preset_list.setCurrentRow(0)
+            self._on_preset_selected(self._preset_list.item(0))
+
+    def _save_and_reload(self):
+        import json
+        try:
+            with open(self._preset_path(), encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            raw = {}
+        for k, v in self._data.items():
+            raw[k] = v
+        try:
+            with open(self._preset_path(), "w", encoding="utf-8") as f:
+                json.dump(raw, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"[EmotionGUI] save failed: {e}")
+            return
+        try:
+            from vts.expression_controller import get_controller
+            get_controller().load_registry(self._preset_path())
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Helpers: float ↔ slider int
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _to_int(value: float, step: float) -> int:
+        return round(value / step)
+
+    @staticmethod
+    def _to_float(tick: int, step: float) -> float:
+        return round(tick * step, 3)
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+    def _init_ui(self):
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── Left: preset list ──────────────────────────────────────────
+        left = QFrame(self)
+        left.setFixedWidth(190)
+        left.setStyleSheet("background:#FAFAFA; border-right:1px solid #E0E0E0;")
+        left_lay = QVBoxLayout(left)
+        left_lay.setContentsMargins(0, 16, 0, 16)
+        left_lay.setSpacing(4)
+
+        list_title = QLabel("Presets", left)
+        list_title.setStyleSheet(
+            "font-size:13px; font-weight:bold; color:#555; padding:0 14px 8px 14px;"
+        )
+        left_lay.addWidget(list_title)
+
+        self._preset_list = QListWidget(left)
+        self._preset_list.setStyleSheet("""
+            QListWidget { border:none; background:transparent; }
+            QListWidget::item { padding:10px 16px; font-size:13px; border-radius:4px; }
+            QListWidget::item:selected { background:#E3F2FD; color:#0078D4; }
+            QListWidget::item:hover:!selected { background:#F5F5F5; }
+        """)
+        self._preset_list.itemClicked.connect(self._on_preset_selected)
+        left_lay.addWidget(self._preset_list, 1)
+        root.addWidget(left)
+
+        # ── Right: detail panel ────────────────────────────────────────
+        right = QWidget(self)
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(36, 28, 36, 28)
+        right_lay.setSpacing(0)
+
+        # Title row + Test button
+        title_row = QHBoxLayout()
+        self._detail_title = SubtitleLabel("Select a preset", right)
+        setFont(self._detail_title, 18)
+        self._test_btn = PushButton(FIF.PLAY, "Test", right)
+        self._test_btn.setFixedSize(80, 32)
+        self._test_btn.setEnabled(False)
+        self._test_btn.clicked.connect(self._on_test)
+        title_row.addWidget(self._detail_title)
+        title_row.addStretch(1)
+        title_row.addWidget(self._test_btn)
+        right_lay.addLayout(title_row)
+
+        sep = QFrame(right)
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color:#E8E8E8; margin:12px 0;")
+        right_lay.addWidget(sep)
+        right_lay.addSpacing(8)
+
+        # Slider form
+        form = QFrame(right)
+        form_lay = QVBoxLayout(form)
+        form_lay.setContentsMargins(0, 0, 0, 0)
+        form_lay.setSpacing(20)
+
+        for field, label, fmin, fmax, step in self._FIELDS:
+            block = QVBoxLayout()
+            block.setSpacing(6)
+
+            # Label row: name on left, current value on right
+            label_row = QHBoxLayout()
+            lbl = QLabel(label, form)
+            lbl.setStyleSheet("font-size:13px; color:#444; font-weight:500;")
+            val_lbl = QLabel("—", form)
+            val_lbl.setFixedWidth(70)
+            val_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            val_lbl.setStyleSheet("font-size:13px; color:#0078D4; font-weight:bold;")
+            label_row.addWidget(lbl)
+            label_row.addStretch(1)
+            label_row.addWidget(val_lbl)
+            block.addLayout(label_row)
+
+            # Slider row: min label, slider, max label
+            slider_row = QHBoxLayout()
+            slider_row.setSpacing(8)
+            min_lbl = QLabel(f"{fmin:.1f}s", form)
+            min_lbl.setStyleSheet("font-size:11px; color:#AAA;")
+            max_lbl = QLabel(f"{fmax:.0f}s", form)
+            max_lbl.setStyleSheet("font-size:11px; color:#AAA;")
+
+            slider = QSlider(Qt.Horizontal, form)
+            int_min = self._to_int(fmin, step) if fmin > 0 else 0
+            int_max = self._to_int(fmax, step)
+            slider.setRange(int_min, int_max)
+            slider.setSingleStep(1)
+            slider.setPageStep(max(1, int_max // 20))
+            slider.setStyleSheet(self._SLIDER_STYLE)
+            slider.setProperty("emo_field", field)
+            slider.setProperty("emo_step", step)
+            # store val_lbl reference on slider for update
+            slider.setProperty("val_lbl_id", id(val_lbl))
+            slider.valueChanged.connect(self._on_slider_changed)
+
+            self._sliders[field] = (slider, val_lbl)
+
+            slider_row.addWidget(min_lbl)
+            slider_row.addWidget(slider, 1)
+            slider_row.addWidget(max_lbl)
+            block.addLayout(slider_row)
+
+            form_lay.addLayout(block)
+
+        # Auto-return-to-idle checkbox
+        chk_block = QVBoxLayout()
+        chk_block.setSpacing(4)
+        chk_header = QLabel("Auto Return to Idle", form)
+        chk_header.setStyleSheet("font-size:13px; color:#444; font-weight:500;")
+        chk_block.addWidget(chk_header)
+
+        chk_row = QHBoxLayout()
+        chk_row.setSpacing(10)
+        self._auto_return_chk = QCheckBox("Enable", form)
+        self._auto_return_chk.setStyleSheet("QCheckBox { font-size:13px; color:#333; }")
+        self._auto_return_chk.stateChanged.connect(self._on_auto_return_changed)
+        chk_desc = QLabel("Fade out after delay — otherwise stays until next turn", form)
+        chk_desc.setStyleSheet("font-size:11px; color:#999;")
+        chk_row.addWidget(self._auto_return_chk)
+        chk_row.addWidget(chk_desc)
+        chk_row.addStretch(1)
+        chk_block.addLayout(chk_row)
+        form_lay.addLayout(chk_block)
+
+        right_lay.addWidget(form)
+        right_lay.addStretch(1)
+
+        note = QLabel("Changes are saved instantly to emotion_presets.json and hot-reloaded.", right)
+        note.setStyleSheet("font-size:11px; color:#BBBBBB;")
+        right_lay.addWidget(note)
+
+        root.addWidget(right, 1)
+
+    # ------------------------------------------------------------------
+    # Callbacks
+    # ------------------------------------------------------------------
+    def _on_preset_selected(self, item: QListWidgetItem):
+        name = item.text()
+        self._current_preset = name
+        cfg = self._data.get(name, {})
+
+        self._detail_title.setText(f"Preset: {name}")
+        self._test_btn.setEnabled(True)
+
+        for field, label, fmin, fmax, step in self._FIELDS:
+            slider, val_lbl = self._sliders[field]
+            raw_val = float(cfg.get(field, step))
+            tick = self._to_int(raw_val, step)
+            slider.blockSignals(True)
+            slider.setValue(tick)
+            slider.blockSignals(False)
+            val_lbl.setText(f"{raw_val:.2f} s")
+
+        self._auto_return_chk.blockSignals(True)
+        self._auto_return_chk.setChecked(bool(cfg.get("auto_return_to_idle", False)))
+        self._auto_return_chk.blockSignals(False)
+        self._refresh_delay_enabled()
+
+    def _refresh_delay_enabled(self):
+        enabled = self._auto_return_chk.isChecked() if self._auto_return_chk else False
+        pair = self._sliders.get("idle_return_delay_sec")
+        if pair:
+            pair[0].setEnabled(enabled)
+
+    def _on_slider_changed(self, tick: int):
+        if not self._current_preset:
+            return
+        slider = self.sender()
+        field = slider.property("emo_field")
+        step = slider.property("emo_step")
+        val = self._to_float(tick, step)
+
+        # Update value label
+        pair = self._sliders.get(field)
+        if pair:
+            pair[1].setText(f"{val:.2f} s")
+
+        if field and self._current_preset in self._data:
+            self._data[self._current_preset][field] = val
+            self._save_and_reload()
+
+    def _on_auto_return_changed(self, state: int):
+        if not self._current_preset:
+            return
+        checked = (state == Qt.Checked)
+        if self._current_preset in self._data:
+            self._data[self._current_preset]["auto_return_to_idle"] = checked
+            self._save_and_reload()
+        self._refresh_delay_enabled()
+
+    def _on_test(self):
+        if not self._current_preset:
+            return
+        try:
+            from vts.expression_controller import get_controller
+            get_controller().transition_to(self._current_preset)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"[EmotionGUI] test failed: {e}")
+
+
 class SubtitleWindow(FluentWindow):
     def __init__(self, callback_func, asr_callback_func=None):
         super().__init__()
@@ -1071,6 +1593,9 @@ class SubtitleWindow(FluentWindow):
         self.chatInterface = ChatInterface(self._on_send, self._on_asr, self)
         self.settingInterface = SettingInterface(self)
         self.openclawInterface = OpenClawInterface(self)
+        self.emotionPresetsInterface = EmotionPresetsInterface(self)
+        # characterInterface 已合并到 chatInterface，此处保留别名供外部访问 engine()
+        self.characterInterface = self.chatInterface
 
         self.signals.openclaw_signal.connect(self._on_openclaw_event)
         self.signals.title_signal.connect(self._on_title_updated)
@@ -1080,15 +1605,35 @@ class SubtitleWindow(FluentWindow):
         # 悬浮 Live API 快捷按钮（始终置顶，独立于主窗口）
         self._live_float_btn = LiveApiFloatButton(self._on_live_api_float_toggle)
         self._live_float_btn.show()
+        # 悬浮 VAD 能量监控（Live API 激活时显示）
+        self._vad_monitor = VadMonitorWidget()
         
     def initNavigation(self):
         self.addSubInterface(self.chatInterface, FIF.CHAT, 'Chat')
         self.addSubInterface(self.openclawInterface, FIF.COMMAND_PROMPT, 'OpenClaw')
+        self.addSubInterface(self.emotionPresetsInterface, FIF.PALETTE, '表情预设')
         self.addSubInterface(self.settingInterface, FIF.SETTING, 'Settings', NavigationItemPosition.BOTTOM)
         # 等 UI 完全就绪后再自动恢复会话（避免初始化顺序问题）
         QTimer.singleShot(300, self._auto_restore_session)
         # 同步 Live API 初始状态到悬浮按钮
         QTimer.singleShot(400, self._sync_live_btn_initial)
+        # 注：QWebEngineView 已改为懒加载（首次点击渲染模式时才创建），
+        # 所以此处不再需要提前 repaint。repaint 在 engine.on_ready 回调中触发。
+
+    def _force_navbar_repaint(self):
+        """QWebEngineView 启动时会导致 FluentWindow 导航栏不刷新变黑，强制 repaint 修复。"""
+        try:
+            self.update()
+            self.repaint()
+            # 遍历子控件找到 navigationInterface 并强制刷新
+            for child in self.findChildren(QWidget):
+                name = child.objectName()
+                if "navigation" in name.lower() or "nav" in name.lower():
+                    child.update()
+                    child.repaint()
+                    break
+        except Exception:
+            pass
 
     def _sync_live_btn_initial(self):
         """启动后同步一次 Live API 初始状态到悬浮按钮。"""
@@ -1100,6 +1645,8 @@ class SubtitleWindow(FluentWindow):
                 else getattr(main_module, 'LIVE_API_ENABLED', False)
             )
             self._live_float_btn.set_active(active)
+            if hasattr(self, '_vad_monitor'):
+                self._vad_monitor.set_active(active)
 
     def _auto_restore_session(self):
         """
@@ -1268,6 +1815,8 @@ class SubtitleWindow(FluentWindow):
         """当 Settings 里的开关被手动拨动时，同步悬浮按钮显示。"""
         if hasattr(self, '_live_float_btn'):
             self._live_float_btn.set_active(active)
+        if hasattr(self, '_vad_monitor'):
+            self._vad_monitor.set_active(active)
 
 def launch_subtitle_gui(app, callback_func, asr_callback_func=None):
     window = SubtitleWindow(callback_func, asr_callback_func)
