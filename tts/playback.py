@@ -144,6 +144,11 @@ class PlaybackManager:
         self.pending_audio: dict[int, tuple] = {}
         self.next_seq_to_play = 1
         self.play_condition = asyncio.Condition()
+        # 句子开始播放回调：fn(sentence_id: str) -> None
+        self.on_sentence_start: Callable[[str], None] | None = None
+        # 轮次最后一句播完回调：fn() -> None
+        self.on_turn_playback_complete: Callable[[], None] | None = None
+        self._turn_last_sentence_id: str | None = None
 
     async def add_to_playlist(
         self, full_audio_data, sentence_id: str, japanese_text: str
@@ -182,6 +187,12 @@ class PlaybackManager:
                 f"(大小: {len(audio_chunk)} samples)"
             )
 
+            if is_first_chunk and self.on_sentence_start is not None:
+                try:
+                    self.on_sentence_start(sentence_id)
+                except Exception as _cb_err:
+                    self.logger.warning(f"on_sentence_start 回调异常: {_cb_err}")
+
             asyncio.create_task(
                 self.player.play_audio_chunk_and_signal_completion(
                     audio_chunk,
@@ -214,6 +225,10 @@ class PlaybackManager:
             )
             await self.add_to_playlist(audio_chunk, sentence_id, japanese_text)
 
+    def mark_turn_last_sentence(self, sentence_id: str) -> None:
+        """标记本轮最后一句 ID；该句播完后触发 on_turn_playback_complete。"""
+        self._turn_last_sentence_id = sentence_id
+
     async def run(self) -> None:
         """播放主循环，按句子序号顺序消费 pending_audio。"""
         self.logger.info("🎬 [监控] 播放管理器 'run' 循环已启动，等待播放任务...")
@@ -241,6 +256,15 @@ class PlaybackManager:
                     )
 
                 await self.player_is_ready.wait()
+                # 检查刚完成的句子是否是本轮最后一句
+                _just_finished = self.current_playing_id
+                if _just_finished and _just_finished == self._turn_last_sentence_id:
+                    self._turn_last_sentence_id = None
+                    if self.on_turn_playback_complete is not None:
+                        try:
+                            self.on_turn_playback_complete()
+                        except Exception as _cb_err:
+                            self.logger.warning(f"on_turn_playback_complete 回调异常: {_cb_err}")
                 self.player_is_ready.clear()
                 self.current_playing_id = sentence_id
                 self.logger.info(f"▶️ [监控] 开始播放句子: {sentence_id}")
@@ -248,6 +272,12 @@ class PlaybackManager:
                     f"[PLAYBACK] 接收到首个音频块并开始播放: {sentence_id} "
                     f"(大小: {len(full_audio_data)} samples)"
                 )
+
+                if self.on_sentence_start is not None:
+                    try:
+                        self.on_sentence_start(sentence_id)
+                    except Exception as _cb_err:
+                        self.logger.warning(f"on_sentence_start 回调异常: {_cb_err}")
 
                 asyncio.create_task(
                     self.player.play_full_audio_and_signal_completion(
