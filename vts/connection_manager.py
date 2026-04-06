@@ -9,7 +9,7 @@ import logging
 import os
 import random
 import time
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 
 import websocket as ws
 
@@ -27,6 +27,12 @@ class VTSConnectionManager:
         self.message_buffer = []
         self.auth_token = None
         self.ws_app = None
+        # 重连后的回调（如 ExpressionController 恢复表情状态）
+        self.on_reconnect_callback = None
+
+        # 后台重连线程控制（保证只有一个重连线程在跑）
+        self._reconnect_lock = Lock()
+        self._reconnect_running = False
 
         # token 文件路径，默认从 config.settings 读取
         if token_file is None:
@@ -65,16 +71,18 @@ class VTSConnectionManager:
     def connect(self) -> bool:
         if self.connected and self.ws and self.ws.connected:
             return True
+        _is_reconnect = self.reconnect_attempts > 0
         self.disconnect()
         try:
             self.ws = ws.WebSocket()
-            self.ws.settimeout(10)
+            self.ws.settimeout(10)  # 仅用于建连阶段
             self.ws.connect(
                 self.ws_url,
                 skip_utf8_validation=True,
                 suppress_origin=True,
                 enable_multithread=True,
             )
+            self.ws.settimeout(None)  # 建连成功后取消全局超时，避免误判断联
             logger.info("✅ VTS WebSocket连接成功")
             self.connected = True
             self.reconnect_attempts = 0
@@ -88,6 +96,15 @@ class VTSConnectionManager:
                 self.request_auth_token()
 
             self._send_buffered_messages()
+
+            # 重连后通知上层恢复表情状态
+            if _is_reconnect and self.on_reconnect_callback is not None:
+                try:
+                    logger.info("🔄 VTS重连成功，触发表情状态恢复回调")
+                    self.on_reconnect_callback()
+                except Exception as cb_err:
+                    logger.warning(f"on_reconnect_callback 异常: {cb_err}")
+
             return True
         except Exception as e:
             self._handle_connection_error(e)
@@ -105,37 +122,69 @@ class VTSConnectionManager:
 
     def _handle_connection_error(self, error) -> None:
         self.connected = False
-        if self.reconnect_attempts >= self.max_reconnect_attempts:
-            logger.error(f"❌ 达到最大重连次数({self.max_reconnect_attempts})，放弃连接")
-            return
-        backoff = min(0.5 * (2 ** self.reconnect_attempts) + random.uniform(0, 1), 30)
-        self.reconnect_attempts += 1
-        logger.warning(
-            f"⚠️ VTS连接失败: {error}. 将在{backoff:.2f}秒后尝试重连 "
-            f"(尝试 {self.reconnect_attempts}/{self.max_reconnect_attempts})"
-        )
-        time.sleep(backoff)
-        Thread(target=self.connect, daemon=True).start()
+        logger.warning(f"⚠️ VTS连接错误: {error}，触发后台重连")
+        self._start_background_reconnect()
+
+    def _start_background_reconnect(self) -> None:
+        """确保只有一个后台重连线程在运行。"""
+        with self._reconnect_lock:
+            if self._reconnect_running:
+                return
+            self._reconnect_running = True
+        Thread(target=self._reconnect_loop, daemon=True, name="vts-reconnect").start()
+
+    def _reconnect_loop(self) -> None:
+        """后台重连循环，指数退避，sleep 只在此线程中发生，不阻塞任何调用方。"""
+        try:
+            while not self.connected:
+                if self.reconnect_attempts >= self.max_reconnect_attempts:
+                    logger.error(f"❌ 达到最大重连次数({self.max_reconnect_attempts})，放弃连接")
+                    break
+                backoff = min(0.5 * (2 ** self.reconnect_attempts) + random.uniform(0, 1), 30)
+                self.reconnect_attempts += 1
+                logger.warning(
+                    f"⚠️ VTS将在 {backoff:.2f}s 后尝试重连 "
+                    f"({self.reconnect_attempts}/{self.max_reconnect_attempts})"
+                )
+                time.sleep(backoff)
+                self.connect()
+        finally:
+            with self._reconnect_lock:
+                self._reconnect_running = False
 
     # ------------------------------------------------------------------
     # 消息收发
     # ------------------------------------------------------------------
-    def send_message(self, payload: dict) -> bool:
+    def send_message(self, payload: dict, bufferable: bool = True) -> bool:
+        """发送消息。断联时立即返回 False，不阻塞调用方。
+        bufferable=False 用于高频 fire-and-forget 消息（如口型数据），断联时直接丢弃。
+        """
         if not self.connected or not self.ws:
-            logger.info("🔄 WebSocket未连接，尝试连接...")
-            if not self.connect():
-                logger.info("📩 连接失败，消息已加入缓冲区")
+            if bufferable:
                 self.message_buffer.append(payload)
-                return False
+                self._start_background_reconnect()
+            return False
         try:
             with self.ws_lock:
                 self.ws.send(json.dumps(payload))
             return True
         except Exception as e:
             logger.warning(f"📤 消息发送失败: {e}")
-            self.message_buffer.append(payload)
+            if bufferable:
+                self.message_buffer.append(payload)
             self._handle_connection_error(e)
             return False
+
+    def send_ping(self) -> None:
+        """发送 WebSocket 协议级 PING 帧，保持 TCP 连接活跃。"""
+        if not self.connected or not self.ws:
+            return
+        try:
+            with self.ws_lock:
+                self.ws.ping()
+        except Exception as e:
+            logger.warning(f"📡 PING 发送失败: {e}")
+            self._handle_connection_error(e)
 
     def _send_buffered_messages(self) -> None:
         if not self.message_buffer:
@@ -219,6 +268,9 @@ class VTSConnectionManager:
     # 控制指令
     # ------------------------------------------------------------------
     def send_mouth_data(self, mouth_value: float) -> bool:
+        """高频口型数据，断联时直接丢弃，绝不阻塞播放线程。"""
+        if not self.connected or not self.ws:
+            return False
         payload = {
             "apiName": "VTubeStudioPublicAPI",
             "apiVersion": "1.0",
@@ -226,9 +278,12 @@ class VTSConnectionManager:
             "messageType": "InjectParameterDataRequest",
             "data": {"parameterValues": [{"id": "MouthOpen", "value": mouth_value}]},
         }
-        return self.send_message(payload)
+        return self.send_message(payload, bufferable=False)
 
     def send_parameters(self, param_dict: dict) -> bool:
+        """高频参数注入，断联时直接丢弃，不阻塞调用方。"""
+        if not self.connected or not self.ws:
+            return False
         payload = {
             "apiName": "VTubeStudioPublicAPI",
             "apiVersion": "1.0",
@@ -240,7 +295,7 @@ class VTSConnectionManager:
                 ]
             },
         }
-        return self.send_message(payload)
+        return self.send_message(payload, bufferable=False)
 
     def trigger_hotkey(self, name_or_id: str) -> bool:
         payload = {
@@ -277,7 +332,23 @@ class VTSConnectionManager:
             "data": data,
         }
         logger.info(f"发送表情激活请求: {payload}")
-        return self.send_message(payload)
+        ok = self.send_message(payload)
+        if ok and self.connected:
+            # 读取响应仅用于记录错误；失败时静默忽略，不触发二次重连
+            try:
+                with self.ws_lock:
+                    self.ws.settimeout(0.5)
+                    raw = self.ws.recv()
+                resp = json.loads(raw)
+                err = (resp.get("data") or {}).get("errorID")
+                msg = (resp.get("data") or {}).get("message", "")
+                if err:
+                    logger.warning(f"[VTS] 表情请求错误 errorID={err}: {msg}")
+                else:
+                    logger.debug(f"[VTS] 表情请求成功: {resp.get('messageType')}")
+            except Exception:
+                pass  # 连接不稳定时忽略响应读取，send_message 已负责重连
+        return ok
 
     def send_heartbeat(self) -> bool:
         payload = {
@@ -287,4 +358,14 @@ class VTSConnectionManager:
             "messageType": "APIStateRequest",
             "data": {},
         }
-        return self.send_message(payload)
+        ok = self.send_message(payload)
+        if ok:
+            # 读掉 VTS 返回的 APIStateResponse，防止缓冲区堆积导致 VTS 主动断联
+            try:
+                with self.ws_lock:
+                    self.ws.settimeout(0.3)
+                    self.ws.recv()
+                    self.ws.settimeout(None)
+            except Exception:
+                pass
+        return ok

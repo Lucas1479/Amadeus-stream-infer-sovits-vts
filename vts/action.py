@@ -50,11 +50,17 @@ def configure(vts_manager=None, pending_actions=None, delegate_fn=None):
 # =============================================================================
 
 def heartbeat_worker():
-    """VTS 心跳工作线程"""
+    """VTS 心跳工作线程。断联时主动触发后台重连，不阻塞。"""
     while True:
         try:
-            time.sleep(8)
-            if _vts_manager is not None:
+            time.sleep(3)
+            if _vts_manager is None:
+                continue
+            if not _vts_manager.connected:
+                _vts_manager._start_background_reconnect()
+            else:
+                # 先发协议级 PING 帧保持 TCP 连接，再发应用层心跳
+                _vts_manager.send_ping()
                 _vts_manager.send_heartbeat()
         except Exception as e:
             logger.error(f"心跳线程异常: {e}")
@@ -129,13 +135,8 @@ def action_worker():
                 active = True if active_str is None else (str(active_str).lower() == "true")
                 weight = attrs.get("weight")
 
-                # 特例：思考表情持续到回合结束
-                if name == "Thinking.exp3.json" and active:
-                    dur = 15
-
-                # 特例：生气和失望表情至少持续3秒
-                if name in ["Angry.exp3.json", "Disappointed.exp3.json"] and active:
-                    dur = max(dur, 3.0)
+                # 表情持续时间由 emotion_presets.json 注册表管理（ExpressionController），
+                # action_worker 仅处理直接的 EXPR 指令，不覆盖 dur。
 
                 if _vts_manager is not None:
                     _vts_manager.activate_expression(
