@@ -234,8 +234,18 @@ class MultimodalInputManager:
                 frames_per_buffer=self.audio_frames_per_buffer,
             )
             if self.mic_input_device_index is not None:
-                open_kwargs["input_device_index"] = self.mic_input_device_index
-            self._mic_stream = self._pa.open(**open_kwargs)
+                try:
+                    self._mic_stream = self._pa.open(
+                        **open_kwargs, input_device_index=self.mic_input_device_index
+                    )
+                except Exception as e:
+                    import logging as _log
+                    _log.getLogger(__name__).warning(
+                        f"麦克风设备[{self.mic_input_device_index}]打开失败: {e}，回退系统默认"
+                    )
+                    self._mic_stream = None
+            if self._mic_stream is None:
+                self._mic_stream = self._pa.open(**open_kwargs)
 
         # 系统音频采集占位（未来实现）
         # TODO: Implement system/loopback audio capture per platform
@@ -292,11 +302,26 @@ class MultimodalInputManager:
                     break
                 except Exception:
                     frame = None
+                # 拉取音频块（与帧无关，VAD 独立于视频帧运行）
+                audio_chunk = None
+                try:
+                    import math
+                    reads_per_frame = max(1, int(math.ceil((self.audio_rate / max(1, self.audio_frames_per_buffer)) / max(1, self.target_fps))))
+                except Exception:
+                    reads_per_frame = 1
+                for _ in range(reads_per_frame):
+                    ch = self._read_audio_chunk()
+                    if ch is not None:
+                        audio_chunk = ch
+
+                # 无视频帧时：仍处理音频 VAD，跳过视觉处理
                 if frame is None:
+                    if audio_chunk is not None:
+                        self._process_audio_vad(audio_chunk)
                     await asyncio.sleep(0.01)
                     continue
 
-                # 更新帧缓存（按步进缓存，并附上简单“有趣度”评分）
+                # 更新帧缓存（按步进缓存，并附上简单"有趣度"评分）
                 try:
                     if (len(self._frame_cache) == 0) or (len(self._frame_cache) % self.cache_stride == 0):
                         score = 0.0
@@ -312,19 +337,7 @@ class MultimodalInputManager:
                 except Exception:
                     pass
 
-                # 拉取音频块：按需多次读取以匹配采样率，避免低fps下缓冲堆积
-                audio_chunk = None
-                try:
-                    import math
-                    reads_per_frame = max(1, int(math.ceil((self.audio_rate / max(1, self.audio_frames_per_buffer)) / max(1, self.target_fps))))
-                except Exception:
-                    reads_per_frame = 1
-                for _ in range(reads_per_frame):
-                    ch = self._read_audio_chunk()
-                    if ch is not None:
-                        audio_chunk = ch
-
-                # 触发检测
+                # 触发检测（含视觉+音频）
                 triggered = await self._smart_trigger_check(frame, audio_chunk)
                 if triggered:
                     now_ts = time.time()
@@ -418,6 +431,36 @@ class MultimodalInputManager:
             return None
 
     # --------------- 内部：触发逻辑 ---------------
+
+    def _process_audio_vad(self, audio_chunk: np.ndarray) -> None:
+        """仅处理音频 VAD 状态机（无帧时独立调用）。"""
+        if audio_chunk is None or audio_chunk.size == 0:
+            return
+        energy = float(np.mean(np.abs(audio_chunk)))
+        self._last_audio_energy = energy
+        now = time.time()
+        if self._agent_speaking:
+            return
+        if not self._voice_active:
+            if energy >= self.vad_upper:
+                self._voice_active = True
+                self._session_start_ts = now
+                self._session_frames = []
+                self.state = "LISTENING_TO_USER"
+                print(f"[VAD] 🎤 检测到用户说话 (能量: {energy:.1f})", flush=True)
+        else:
+            if energy < self.vad_lower:
+                if self._last_below_ts == 0.0:
+                    self._last_below_ts = now
+                elif (now - self._last_below_ts) * 1000.0 >= self.vad_hangover_ms:
+                    self._voice_active = False
+                    self._last_below_ts = 0.0
+                    if self.state == "LISTENING_TO_USER":
+                        self.state = "USER_TURN_ENDED"
+                        print(f"[VAD] 🔇 用户停止说话 (静音持续 {self.vad_hangover_ms}ms)", flush=True)
+            else:
+                self._last_below_ts = 0.0
+
     async def _smart_trigger_check(self, frame: np.ndarray, audio_chunk: Optional[np.ndarray]) -> bool:
         # 1) VAD: 简单能量阈值
         vad_trigger = False

@@ -234,12 +234,23 @@ async def run(mode: str, model_name: str, api_key: str):
         if _mic_env.isdigit():
             mic_device_index = int(_mic_env)
         print_json({"type": "status", "data": f"MIC_DEVICE: {mic_device_index}"})
-        try:
-            stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True,
-                            input_device_index=mic_device_index, frames_per_buffer=CHUNK)
-        except Exception as e:
-            print_json({"type": "error", "data": f"MIC_OPEN_FAIL: {e}"})
-            return
+        stream = None
+        if mic_device_index is not None:
+            try:
+                stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True,
+                                input_device_index=mic_device_index, frames_per_buffer=CHUNK)
+            except Exception as e:
+                print_json({"type": "error", "data": f"MIC_OPEN_FAIL: {e}"})
+                print_json({"type": "status", "data": "MIC_FALLBACK_DEFAULT"})
+        if stream is None:
+            try:
+                stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True,
+                                input_device_index=None, frames_per_buffer=CHUNK)
+                print_json({"type": "status", "data": "MIC_USING_DEFAULT"})
+            except Exception as e:
+                print_json({"type": "error", "data": f"MIC_OPEN_FAIL: {e}"})
+                p.terminate()
+                return
         try:
             while True:
                 # 未开启时静默（不读取/不发送，避免阻塞）
