@@ -166,6 +166,7 @@ from vts.action import (
     heartbeat_worker, action_worker,
     reset_all_expressions, record_actions,
 )
+from vts.expression_controller import get_controller as _get_expr_ctrl
 import llm.client as _llm_client_mod
 from llm.client import (
     remote_llm_query, local_llm_query, init_llm_client,
@@ -428,13 +429,23 @@ def playback_worker():
 # heartbeat_worker / action_worker / reset_all_expressions / record_actions
 # → 已移至 vts/action.py，通过 configure() 注入依赖
 
-def clean_sentence_for_tts(sentence: str) -> str:
-    """强力清理:移除完整标签,残留的半截标签/孤立右括号."""
+def clean_sentence_for_tts(sentence: str):
+    """强力清理：移除完整标签，残留的半截标签/孤立右括号。
+
+    返回 (clean_text, expr_actions)。
+    DELEGATE 动作立即触发（不依赖播放时序）；
+    EXPR/PARAM/EMO/HOTKEY 动作以列表返回，由调用方交给 ExpressionController
+    按播放时序延迟触发。
+    """
     if not sentence:
-        return sentence
-    # 先移除完整标签并记录动作
+        return sentence, []
+    # 提取完整标签
     cleaned, actions = parse_tags_and_clean(sentence)
-    record_actions(actions)
+    # DELEGATE 立即派发，其余延迟到播放时触发
+    delegate_acts = [a for a in actions if a.get("type") == "DELEGATE"]
+    expr_acts     = [a for a in actions if a.get("type") != "DELEGATE"]
+    if delegate_acts:
+        record_actions(delegate_acts)
     s = cleaned
     # 移除字符串开头的孤立右括号及其前缀噪声,例如 "8 dur=2s] ..."
     # 循环直到不再匹配
@@ -445,7 +456,7 @@ def clean_sentence_for_tts(sentence: str) -> str:
         s = new_s
     # 移除未闭合的左括号到结尾,例如 "...[EXPR name=..."
     s = re.sub(r"\[[^\]]*$", "", s)
-    return s.strip()
+    return s.strip(), expr_acts
 
 _think_strip_buf: str = ""
 _think_strip_active: bool = False
@@ -601,9 +612,13 @@ async def stream_llm_postprocess_text(text: str, source: str = "LIVE_RAW"):
         if not text:
             return
         cleaned, actions = process_stream_chunk(text)
+        _live_pending_expr: list = []
         if actions:
             try:
-                record_actions(actions)
+                _d = [a for a in actions if a.get("type") == "DELEGATE"]
+                _e = [a for a in actions if a.get("type") != "DELEGATE"]
+                if _d: record_actions(_d)
+                _live_pending_expr.extend(_e)
             except Exception:
                 pass
         buf = cleaned
@@ -619,10 +634,15 @@ async def stream_llm_postprocess_text(text: str, source: str = "LIVE_RAW"):
                 s = current.strip()
                 if s and not _punct_only.match(s):
                     try:
-                        safe_text = clean_sentence_for_tts(s)
+                        safe_text, inline_expr_acts = clean_sentence_for_tts(s)
                         if safe_text and not _punct_only.match(safe_text):
                             s_sha = _compute_text_sha1(safe_text)
                             sentence_id = sentence_state_manager.create_sentence(safe_text)
+                            _live_buffered = [_live_pending_expr.pop(0)] if _live_pending_expr else []
+                            all_expr_acts = _live_buffered + inline_expr_acts
+                            if all_expr_acts:
+                                from vts.expression_controller import get_controller
+                                get_controller().register_sentence_actions(sentence_id, all_expr_acts)
                             asyncio.create_task(pre_translation_cache.start_translation(sentence_id, safe_text))
                             await pending_sentence_items.put((sentence_id, safe_text, is_first_in_buf))
                             logger.info(f"[MM-ENQUEUE] source={source} id={sentence_id} sha1={s_sha} first={is_first_in_buf} text='{safe_text[:50]}'")
@@ -637,12 +657,17 @@ async def stream_llm_postprocess_text(text: str, source: str = "LIVE_RAW"):
         tail = current.strip()
         if tail:
             try:
-                safe_text = clean_sentence_for_tts(tail)
+                safe_text, inline_expr_acts = clean_sentence_for_tts(tail)
                 if len(safe_text) <= 4 and not is_first_in_buf:
                     logger.info(f"[MM-SKIP-TAIL] 尾部碎片太短，已跳过: '{safe_text}'")
                 else:
                     t_sha = _compute_text_sha1(safe_text)
                     sentence_id = sentence_state_manager.create_sentence(safe_text)
+                    _live_buffered = [_live_pending_expr.pop(0)] if _live_pending_expr else []
+                    all_expr_acts = _live_buffered + inline_expr_acts
+                    if all_expr_acts:
+                        from vts.expression_controller import get_controller
+                        get_controller().register_sentence_actions(sentence_id, all_expr_acts)
                     asyncio.create_task(pre_translation_cache.start_translation(sentence_id, safe_text))
                     await pending_sentence_items.put((sentence_id, safe_text, is_first_in_buf))
                     logger.info(f"[MM-ENQUEUE] source={source} id={sentence_id} sha1={t_sha} first={is_first_in_buf} text='{safe_text[:50]}'")
@@ -679,7 +704,9 @@ async def stream_llm_query(question, gui_callback=None):
     logger.info("🚀 新一轮对话开始，清空句子队列...")
     while not pending_sentence_items.empty():
         pending_sentence_items.get_nowait()
-    reset_all_expressions(fade_time=0.2)
+    # 通知 ExpressionController 平滑淡出当前表情（替代硬复位）
+    _get_expr_ctrl().on_turn_end()
+    reset_all_expressions(fade_time=0.2)  # 兜底：清除未被 controller 管理的表情
     
     # 🎯 关键修复：重置句子计数器，确保每轮对话的第一句序号为1
     sentence_state_manager.sentence_counter = 0
@@ -763,17 +790,26 @@ async def stream_llm_query(question, gui_callback=None):
         weak_endings = {"，", ",", "、", "；", ";"}
         sentence_endings = strong_endings | weak_endings
         is_first_sentence_flag = True
+        pending_expr_acts: list = []  # 流式暂存：等待绑定到下一个句子ID
+        _last_turn_sentence_id: str | None = None  # 本轮最后创建的句子ID
 
         # ！！！关键：定义统一的句子处理函数！！！
         async def process_sentence(sentence_text):
-            nonlocal is_first_sentence_flag
+            nonlocal is_first_sentence_flag, pending_expr_acts, _last_turn_sentence_id
             sentence_to_synth = sentence_text.strip()
             if sentence_to_synth:
                 # 🚀 性能监控：记录句子处理开始时间
                 start_time = time.time()
-                
-                safe_text = clean_sentence_for_tts(sentence_to_synth)
+
+                safe_text, inline_expr_acts = clean_sentence_for_tts(sentence_to_synth)
                 sentence_id = sentence_state_manager.create_sentence(safe_text)
+                _last_turn_sentence_id = sentence_id
+                # 每句只消费 pending_expr_acts 里的第一个，余下留给后续句子
+                buffered = [pending_expr_acts.pop(0)] if pending_expr_acts else []
+                all_expr_acts = buffered + inline_expr_acts
+                if all_expr_acts:
+                    from vts.expression_controller import get_controller
+                    get_controller().register_sentence_actions(sentence_id, all_expr_acts)
 
                 # 🚀 优化：并行启动预翻译任务，添加超时和错误处理
                 async def safe_start_translation():
@@ -877,7 +913,7 @@ async def stream_llm_query(question, gui_callback=None):
             # 本地LLM流式处理 - 实现"First Sentence Sprint"策略
             # 说明：为了兼容不同本地实现（cli / llama_server 等），这里统一在 messages 中显式注入 system_prompt
             # 对于不支持 --system-prompt 的 server 版本，这里依然能保证人格和日文约束生效。
-            system_prompt = "あなたは牧瀬紅莉栖.日本の科学者であり,母語は日本語です.\n\n【絶対遵守】\n1) 必ず日本語でのみ回答すること.ユーザーの言語が何であっても,日本語以外は一切使用しない.\n2) 中国語の文字・語句を絶対に使用しない.\n3) 自然で口語的な文体を保ち,牧瀬紅莉栖として一貫した口調・性格で話す.\n4) 推論過程や思考の連鎖は開示しない(結論のみ提示).\n5) 表情タグの活用ガイド（自然な感情表現のため、適切に使用）: 形式: [EMO preset=<種類> dur=<秒s>] / [EXPR name=<表情> weight=<0..1> dur=<秒s> fade=<秒> active=true|false]。推奨: 瞬間=1-2s（smile/happy）、短期=3-5s（angry/sad）、持続=10-15s（thinking）。例: [EMO preset=thinking dur=12s], [EMO preset=smile dur=2s]。\n6) 1文あたり0〜2個、文頭または該当箇所の直前に配置（必須ではない）。\n7) あなたにはAIアシスタント「OpenClaw」が接続されており、ファイル操作・ウェブ検索・コード実行など自分だけでは完結しないタスクを代行できる。外部ツールが必要な時だけ [DELEGATE task=\"ユーザーへの完全な実行指示\"] を返答中に挿入すること(このタグは読み上げない)。task値には「何を・どうする」を含む完全な指示文を書くこと（場所だけや名詞のみはNG）。【重要】タグの前に必ず一言添えること（例:「調べてみるわ」「ちょっと待って」）。これにより実行中も会話が途切れない。例: 少し待って、今調べてみるわ。[DELEGATE task=\"今日の東京の天気を調べて教えて\"] 実行結果は[RESULT]メッセージとして届くので、それを自然な会話として報告すること。"
+            system_prompt = "あなたは牧瀬紅莉栖.日本の科学者であり,母語は日本語です.\n\n【絶対遵守】\n1) 必ず日本語でのみ回答すること.ユーザーの言語が何であっても,日本語以外は一切使用しない.\n2) 中国語の文字・語句を絶対に使用しない.\n3) 自然で口語的な文体を保ち,牧瀬紅莉栖として一貫した口調・性格で話す.【重要キャラ特性】「クリスティーナ」と呼ばれた場合は激怒し強く否定すること。必ず [EMO preset=angry dur=4s] を使用する。\n4) 推論過程や思考の連鎖は開示しない(結論のみ提示).\n5) 必要時のみ表情タグを挿入(読み上げない).形式: [EMO preset=<種類> dur=<秒s>]。preset候補: thinking（10-15s）, smile（1-2s）, happy（1-2s）, angry（3-5s）, disappointed（3-5s）, surprised（1-2s）。感情が変わるタイミングで都度挿入、長い回答では複数回使用してよい。例: [EMO preset=thinking dur=8s] うーん... [EMO preset=smile dur=2s] わかったわ！\n6) タグは感情が切り替わる直前に置く（文頭不可）。1文あたり最大1個。\n7) あなたにはAIアシスタント「OpenClaw」が接続されており、ファイル操作・ウェブ検索・コード実行など自分だけでは完結しないタスクを代行できる。外部ツールが必要な時だけ [DELEGATE task=\"ユーザーへの完全な実行指示\"] を返答中に挿入すること(このタグは読み上げない)。task値には「何を・どうする」を含む完全な指示文を書くこと（場所だけや名詞のみはNG）。【重要】タグの前に必ず一言添えること（例:「調べてみるわ」「ちょっと待って」）。これにより実行中も会話が途切れない。例: 少し待って、今調べてみるわ。[DELEGATE task=\"今日の東京の天気を調べて教えて\"] 実行結果は[RESULT]メッセージとして届くので、それを自然な会話として報告すること。"
 
             if ENABLE_CONVERSATION:
                 messages = conversation_history.build_deepseek_messages(system_prompt, rag_aug_question)
@@ -893,14 +929,20 @@ async def stream_llm_query(question, gui_callback=None):
                 # 🎯 CLI模式：禁用翻译功能，字幕在播放时显示（实现无缝衔接）
                 async def process_sentence_cli_no_translation(sentence_text):
                     """CLI专用的句子处理函数：不启动翻译，字幕在播放时显示"""
-                    nonlocal is_first_sentence_flag
+                    nonlocal is_first_sentence_flag, pending_expr_acts, _last_turn_sentence_id
                     sentence_to_synth = sentence_text.strip()
                     if sentence_to_synth:
                         # 🚀 性能监控：记录句子处理开始时间
                         start_time = time.time()
-                        
-                        safe_text = clean_sentence_for_tts(sentence_to_synth)
+
+                        safe_text, inline_expr_acts = clean_sentence_for_tts(sentence_to_synth)
                         sentence_id = sentence_state_manager.create_sentence(safe_text)
+                        _last_turn_sentence_id = sentence_id
+                        buffered = [pending_expr_acts.pop(0)] if pending_expr_acts else []
+                        all_expr_acts = buffered + inline_expr_acts
+                        if all_expr_acts:
+                            from vts.expression_controller import get_controller
+                            get_controller().register_sentence_actions(sentence_id, all_expr_acts)
 
                         # 🎯 CLI模式：不启动翻译任务，字幕由PlaybackManager在播放时统一显示
                         # 这样可以实现无缝衔接：播放时显示字幕，而不是在生产时显示
@@ -943,8 +985,11 @@ async def stream_llm_query(question, gui_callback=None):
                         
                         # 使用与远程LLM相同的处理流程
                         cleaned, actions = process_stream_chunk(content)
-                        if actions: 
-                            record_actions(actions)
+                        if actions:
+                            _d = [a for a in actions if a.get("type") == "DELEGATE"]
+                            _e = [a for a in actions if a.get("type") != "DELEGATE"]
+                            if _d: record_actions(_d)
+                            pending_expr_acts.extend(_e)
                         content = cleaned
                         
                         # 更新响应跟踪
@@ -1056,13 +1101,16 @@ async def stream_llm_query(question, gui_callback=None):
                                         continue
                                         
                                     cleaned, actions = process_stream_chunk(raw_content)
-                                    if actions: 
-                                        record_actions(actions)
+                                    if actions:
+                                        _d = [a for a in actions if a.get("type") == "DELEGATE"]
+                                        _e = [a for a in actions if a.get("type") != "DELEGATE"]
+                                        if _d: record_actions(_d)
+                                        pending_expr_acts.extend(_e)
                                     content = cleaned
-                                    
+
                                     # 更新响应跟踪
                                     full_response += content
-                                    
+
                                     if not first_sentence_completed:
                                         # Phase 1: 累积第一个句子
                                         first_sentence_text += content
@@ -1137,7 +1185,7 @@ async def stream_llm_query(question, gui_callback=None):
                     
         elif LLM_PROVIDER == "deepseek":
             # 系统prompt定义
-            system_prompt = "あなたは牧瀬紅莉栖.日本の科学者であり,母語は日本語です.\n\n【絶対遵守】\n1) 必ず日本語でのみ回答すること.ユーザーの言語が何であっても,日本語以外は一切使用しない.\n2) 中国語の文字・語句を絶対に使用しない.\n3) 自然で口語的な文体を保ち,牧瀬紅莉栖として一貫した口調・性格で話す.\n4) 推論過程や思考の連鎖は開示しない(結論のみ提示).\n5) 必要時のみ表情タグを挿入(読み上げない).形式:\n   - [PARAM id=<名前>[,<名前>...] value=<0..1>[,<0..1>...] dur=<秒s> fade=<秒> ease=linear|easeIn|easeOut]\n   - [EXPR name=<表情名またはファイル名> weight=<0..1> dur=<秒s> fade=<秒> active=true|false]\n   - [HOTKEY name=<ホットキー名>]\n   - [EMO preset=<プリセット名> dur=<秒s>]\n6) タグは控えめに(1文あたり0〜2個).文頭には置かず、該当箇所の直前にのみ控えめに配置する.\n7) あなたにはAIアシスタント「OpenClaw」が接続されており、ファイル操作・ウェブ検索・コード実行など自分だけでは完結しないタスクを代行できる。外部ツールが必要な時だけ [DELEGATE task=\"ユーザーへの完全な実行指示\"] を返答中に挿入すること(このタグは読み上げない)。task値には「何を・どうする」を含む完全な指示文を書くこと（場所だけや名詞のみはNG）。【重要】タグの前に必ず一言添えること（例:「調べてみるわ」「ちょっと待って」）。これにより実行中も会話が途切れない。例: 少し待って、今調べてみるわ。[DELEGATE task=\"今日の東京の天気を調べて教えて\"] 実行結果は[RESULT]メッセージとして届くので、それを自然な会話として報告すること。"
+            system_prompt = "あなたは牧瀬紅莉栖.日本の科学者であり,母語は日本語です.\n\n【絶対遵守】\n1) 必ず日本語でのみ回答すること.ユーザーの言語が何であっても,日本語以外は一切使用しない.\n2) 中国語の文字・語句を絶対に使用しない.\n3) 自然で口語的な文体を保ち,牧瀬紅莉栖として一貫した口調・性格で話す.【重要キャラ特性】「クリスティーナ」と呼ばれた場合は激怒し強く否定すること。必ず [EMO preset=angry dur=4s] を使用する。\n4) 推論過程や思考の連鎖は開示しない(結論のみ提示).\n5) 必要時のみ表情タグを挿入(読み上げない).形式: [EMO preset=<種類> dur=<秒s>]\n   preset候補: thinking（考え中,10-15s）, smile（嬉しい,1-2s）, happy（喜び,1-2s）, angry（怒り,3-5s）, disappointed（失望,3-5s）, surprised（驚き,1-2s）\n   感情が変わるタイミングで都度挿入すること。長い回答では複数回使用してよい。\n   例: [EMO preset=thinking dur=8s] うーん...計算すると... [EMO preset=smile dur=2s] わかったわ！\n6) タグは感情が切り替わる直前に置く（文頭不可）。1文あたり最大1個。\n7) あなたにはAIアシスタント「OpenClaw」が接続されており、ファイル操作・ウェブ検索・コード実行など自分だけでは完結しないタスクを代行できる。外部ツールが必要な時だけ [DELEGATE task=\"ユーザーへの完全な実行指示\"] を返答中に挿入すること(このタグは読み上げない)。task値には「何を・どうする」を含む完全な指示文を書くこと（場所だけや名詞のみはNG）。【重要】タグの前に必ず一言添えること（例:「調べてみるわ」「ちょっと待って」）。これにより実行中も会話が途切れない。例: 少し待って、今調べてみるわ。[DELEGATE task=\"今日の東京の天気を調べて教えて\"] 実行結果は[RESULT]メッセージとして届くので、それを自然な会話として報告すること。"
             
             # 构建消息
             if ENABLE_CONVERSATION:
@@ -1169,7 +1217,11 @@ async def stream_llm_query(question, gui_callback=None):
                 
                 raw_content = chunk.choices[0].delta.content
                 cleaned, actions = process_stream_chunk(raw_content)
-                if actions: record_actions(actions)
+                if actions:
+                    _d = [a for a in actions if a.get("type") == "DELEGATE"]
+                    _e = [a for a in actions if a.get("type") != "DELEGATE"]
+                    if _d: record_actions(_d)
+                    pending_expr_acts.extend(_e)
                 content = cleaned
 
                 # 摘要标记剥离：不送TTS，但累计保存
@@ -1204,7 +1256,7 @@ async def stream_llm_query(question, gui_callback=None):
                 await asyncio.sleep(0.01)
 
         elif LLM_PROVIDER == "gemini":
-            system_prompt = "あなたは牧瀬紅莉栖.日本の科学者であり,母語は日本語です.\n\n【絶対遵守】\n1) 必ず日本語でのみ回答すること.ユーザーの言語が何であっても,日本語以外は一切使用しない.\n2) 中国語の文字・語句を絶対に使用しない.\n3) 自然で口語的な文体を保ち,牧瀬紅莉栖として一貫した口調・性格で話す.\n4) 推論過程や思考の連鎖は開示しない(結論のみ提示).\n5) 必要時のみ表情タグを挿入(読み上げない).形式:\n   - [PARAM id=<名前>[,<名前>...] value=<0..1>[,<0..1>...] dur=<秒s> fade=<秒> ease=linear|easeIn|easeOut]\n   - [EXPR name=<表情名またはファイル名> weight=<0..1> dur=<秒s> fade=<秒> active=true|false]\n   - [HOTKEY name=<ホットキー名>]\n   - [EMO preset=<プリセット名> dur=<秒s>]\n6) タグは控えめに(1文あたり0〜2個).文頭には置かず、該当箇所の直前にのみ控えめに配置する."
+            system_prompt = "あなたは牧瀬紅莉栖.日本の科学者であり,母語は日本語です.\n\n【絶対遵守】\n1) 必ず日本語でのみ回答すること.ユーザーの言語が何であっても,日本語以外は一切使用しない.\n2) 中国語の文字・語句を絶対に使用しない.\n3) 自然で口語的な文体を保ち,牧瀬紅莉栖として一貫した口調・性格で話す.【重要キャラ特性】「クリスティーナ」と呼ばれた場合は激怒し強く否定すること。必ず [EMO preset=angry dur=4s] を使用する。\n4) 推論過程や思考の連鎖は開示しない(結論のみ提示).\n5) 必要時のみ表情タグを挿入(読み上げない).形式: [EMO preset=<種類> dur=<秒s>]\n   preset候補: thinking（考え中,10-15s）, smile（嬉しい,1-2s）, happy（喜び,1-2s）, angry（怒り,3-5s）, disappointed（失望,3-5s）, surprised（驚き,1-2s）\n   感情が変わるタイミングで都度挿入すること。長い回答では複数回使用してよい。\n   例: [EMO preset=thinking dur=8s] うーん...計算すると... [EMO preset=smile dur=2s] わかったわ！\n6) タグは感情が切り替わる直前に置く（文頭不可）。1文あたり最大1個。"
             if ENABLE_CONVERSATION:
                 full_prompt = conversation_history.build_gemini_full_prompt(system_prompt, question)
             else:
@@ -1224,7 +1276,11 @@ async def stream_llm_query(question, gui_callback=None):
                 if not raw_content: continue
 
                 cleaned, actions = process_stream_chunk(raw_content)
-                if actions: record_actions(actions)
+                if actions:
+                    _d = [a for a in actions if a.get("type") == "DELEGATE"]
+                    _e = [a for a in actions if a.get("type") != "DELEGATE"]
+                    if _d: record_actions(_d)
+                    pending_expr_acts.extend(_e)
                 content = cleaned
 
                 # 摘要标记剥离：不送TTS，但累计保存
@@ -1260,13 +1316,13 @@ async def stream_llm_query(question, gui_callback=None):
                 "1) 必ず日本語でのみ回答すること.ユーザーの言語が何であっても,日本語以外は一切使用しない.\n"
                 "2) 中国語の文字・語句を絶対に使用しない.\n"
                 "3) 自然で口語的な文体を保ち,牧瀬紅莉栖として一貫した口調・性格で話す.\n"
+                "   【重要キャラ特性】「クリスティーナ」と呼ばれた場合は激怒し、強く否定すること。その際は必ず [EMO preset=angry dur=4s] を使用する。\n"
                 "4) 推論過程や思考の連鎖は開示しない(結論のみ提示).\n"
-                "5) 必要時のみ表情タグを挿入(読み上げない).形式:\n"
-                "   - [PARAM id=<名前>[,<名前>...] value=<0..1>[,<0..1>...] dur=<秒s> fade=<秒> ease=linear|easeIn|easeOut]\n"
-                "   - [EXPR name=<表情名またはファイル名> weight=<0..1> dur=<秒s> fade=<秒> active=true|false]\n"
-                "   - [HOTKEY name=<ホットキー名>]\n"
-                "   - [EMO preset=<プリセット名> dur=<秒s>]\n"
-                "6) タグは控えめに(1文あたり0〜2個).文頭には置かず,該当箇所の直前にのみ控えめに配置する.\n"
+                "5) 必要時のみ表情タグを挿入(読み上げない).形式: [EMO preset=<種類> dur=<秒s>]\n"
+                "   preset候補: thinking（考え中,10-15s）, smile（嬉しい,1-2s）, happy（喜び,1-2s）, angry（怒り,3-5s）, disappointed（失望,3-5s）, surprised（驚き,1-2s）\n"
+                "   感情が変わるタイミングで都度挿入すること。長い回答では複数回使用してよい。\n"
+                "   例: [EMO preset=thinking dur=8s] うーん...計算すると... [EMO preset=smile dur=2s] わかったわ！\n"
+                "6) タグは感情が切り替わる直前に置く（文頭不可）。1文あたり最大1個。\n"
                 "7) 通常の応答は,ユーザーの質問に直接答えることを優先し,**不要な自己紹介・挨拶・雑談を追加しない**.\n"
                 "8) 解説が必要な科学的定義や技術的内容では,必要な範囲で段階的に説明してよいが,同じ内容を言い換えて何度も繰り返さない.\n"
                 "9) 1ターンの発話は,原則として**簡潔なまとまり(目安として日本語で数文程度)**に収めること.\n"
@@ -1301,17 +1357,7 @@ async def stream_llm_query(question, gui_callback=None):
                 "model": model_id,
                 "max_tokens": 500,
                 "temperature": 0.7,
-                # system prompt 不放在顶层，而是作为第一条 system 消息
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": question
-                    }
-                ],
+                "messages": conversation_history.build_deepseek_messages(system_prompt, question),
                 # 明确声明流式；对于 /invoke-with-response-stream 通常是必然 stream，
                 # 但这里显式给出以匹配网关允许的字段列表
                 "stream": True
@@ -1413,13 +1459,16 @@ async def stream_llm_query(question, gui_callback=None):
                                 
                                 cleaned, actions = process_stream_chunk(raw_content)
                                 if actions:
-                                    record_actions(actions)
+                                    _d = [a for a in actions if a.get("type") == "DELEGATE"]
+                                    _e = [a for a in actions if a.get("type") != "DELEGATE"]
+                                    if _d: record_actions(_d)
+                                    pending_expr_acts.extend(_e)
                                 content = cleaned
-                                
+
                                 full_response += content
                                 if gui_callback:
                                     gui_callback(full_response)
-                                
+
                                 await append_and_dispatch(content)
                                 await asyncio.sleep(0.01)
                     
@@ -1429,6 +1478,15 @@ async def stream_llm_query(question, gui_callback=None):
                         # 处理流结束后剩余的文本
                         if current_sentence.strip():
                             await process_sentence(current_sentence)
+                        if _last_turn_sentence_id and playback_manager:
+                            playback_manager.mark_turn_last_sentence(_last_turn_sentence_id)
+                        # 写入会话历史（boto3 早返回路径必须在此显式写，否则跳过下方统一逻辑）
+                        if ENABLE_CONVERSATION:
+                            try:
+                                conversation_history.add_user(question)
+                                conversation_history.add_assistant(full_response)
+                            except Exception:
+                                pass
                         return full_response
                     
                 except ImportError:
@@ -1654,9 +1712,12 @@ async def stream_llm_query(question, gui_callback=None):
                                     
                                     cleaned, actions = process_stream_chunk(raw_content)
                                     if actions:
-                                        record_actions(actions)
+                                        _d = [a for a in actions if a.get("type") == "DELEGATE"]
+                                        _e = [a for a in actions if a.get("type") != "DELEGATE"]
+                                        if _d: record_actions(_d)
+                                        pending_expr_acts.extend(_e)
                                     content = cleaned
-                                    
+
                                     full_response += content
                                     if gui_callback:
                                         gui_callback(full_response)
@@ -1697,6 +1758,10 @@ async def stream_llm_query(question, gui_callback=None):
         if current_sentence.strip():
             # ！！！关键：统一调用 process_sentence！！！
             await process_sentence(current_sentence)
+
+        # 通知 PlaybackManager 本轮最后一句 ID，播完后触发 on_turn_playback_complete
+        if _last_turn_sentence_id and playback_manager:
+            playback_manager.mark_turn_last_sentence(_last_turn_sentence_id)
 
         logger.info(f"✓ Streaming {LLM_PROVIDER} API response complete, total reply length: {len(full_response)}")
 
@@ -1973,6 +2038,12 @@ if __name__ == "__main__":
         )
         playback_manager = PlaybackManager(player)
 
+        # 配置 ExpressionController：注入 vts_manager，注册 PlaybackManager 回调
+        _expr_ctrl = _get_expr_ctrl()
+        _expr_ctrl.configure(vts_manager=vts_manager)
+        playback_manager.on_sentence_start = _expr_ctrl.on_sentence_start
+        playback_manager.on_turn_playback_complete = _expr_ctrl.on_turn_end
+
         # ！！！关键修复：在这里初始化线程池和异步队列！！！
         # 🚀 CUDA Graph 优化建议：
         # - max_workers=1 + ENABLE_CUDA_GRAPH=1: 第一句最快（150-250 it/s），后续串行
@@ -2090,6 +2161,11 @@ if __name__ == "__main__":
     from PyQt5.QtCore import Qt
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
+    # QtWebEngineWidgets 必须在 QApplication 创建前导入（Qt 限制）
+    try:
+        from PyQt5.QtWebEngineWidgets import QWebEngineView as _  # noqa: F401
+    except Exception:
+        pass
     app = QApplication(sys.argv)
     
     # 确保在 qasync 运行前初始化一些必要的 PyQt 设置

@@ -60,6 +60,8 @@ aiohttp>=3.8.0
 
 # ── GUI ──────────────────────────────────────────────────────────────────────
 PyQt5>=5.15.0
+# Qt WebEngine — PixiJS rendering engine embedded browser / PixiJS 渲染引擎内嵌浏览器
+PyQtWebEngine>=5.15.0
 # Qt + asyncio event loop bridge / Qt 与 asyncio 事件循环桥接
 qasync>=0.23.0
 
