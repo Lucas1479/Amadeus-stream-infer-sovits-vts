@@ -29,6 +29,9 @@ class VTSConnectionManager:
         self.ws_app = None
         # 重连后的回调（如 ExpressionController 恢复表情状态）
         self.on_reconnect_callback = None
+        # 口型振幅额外回调（可选）：fn(mouth_value: float) → None
+        # 用于将振幅同步路由到 PixiJS 渲染引擎
+        self.on_mouth_value: callable | None = None
 
         # 后台重连线程控制（保证只有一个重连线程在跑）
         self._reconnect_lock = Lock()
@@ -269,6 +272,12 @@ class VTSConnectionManager:
     # ------------------------------------------------------------------
     def send_mouth_data(self, mouth_value: float) -> bool:
         """高频口型数据，断联时直接丢弃，绝不阻塞播放线程。"""
+        # 路由到渲染引擎（如已绑定）
+        if self.on_mouth_value is not None:
+            try:
+                self.on_mouth_value(mouth_value)
+            except Exception:
+                pass
         if not self.connected or not self.ws:
             return False
         payload = {

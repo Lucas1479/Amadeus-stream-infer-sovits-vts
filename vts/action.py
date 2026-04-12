@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 _active_expressions: set = set()
 _active_expr_lock = Lock()
 
+# 心跳/动作队列暂停标志（切换到 PixiJS 渲染模式时置 True，回到 VTS 时置 False）
+_paused: bool = False
+
 # ===== 依赖注入占位 =====
 _vts_manager = None
 _pending_actions = None
@@ -45,15 +48,31 @@ def configure(vts_manager=None, pending_actions=None, delegate_fn=None):
         _delegate_fn = delegate_fn
 
 
+def set_paused(paused: bool) -> None:
+    """暂停/恢复 VTS 心跳与动作队列。
+
+    切换到 PixiJS 内置渲染时调用 set_paused(True)，
+    切回 VTS 渲染时调用 set_paused(False)。
+    """
+    global _paused
+    _paused = paused
+    logger.info(f"[VTSAction] {'⏸ VTS 心跳已暂停' if paused else '▶ VTS 心跳已恢复'}")
+
+
 # =============================================================================
 # 心跳
 # =============================================================================
 
 def heartbeat_worker():
-    """VTS 心跳工作线程。断联时主动触发后台重连，不阻塞。"""
+    """VTS 心跳工作线程。断联时主动触发后台重连，不阻塞。
+
+    _paused=True 时跳过所有操作（PixiJS 渲染模式下不需要维持 VTS 连接活跃度）。
+    """
     while True:
         try:
             time.sleep(3)
+            if _paused:
+                continue
             if _vts_manager is None:
                 continue
             if not _vts_manager.connected:
@@ -71,10 +90,22 @@ def heartbeat_worker():
 # =============================================================================
 
 def action_worker():
-    """VTS 动作队列消费线程"""
+    """VTS 动作队列消费线程。
+
+    _paused=True 时丢弃队列中的 VTS 动作（PixiJS 渲染模式下 VTS 不应收到指令）。
+    """
     while True:
         try:
             if _pending_actions is None:
+                time.sleep(0.1)
+                continue
+            if _paused:
+                # 清空队列积压，避免切回 VTS 时一次性爆发大量旧指令
+                try:
+                    while not _pending_actions.empty():
+                        _pending_actions.get_nowait()
+                except Exception:
+                    pass
                 time.sleep(0.1)
                 continue
             act = _pending_actions.get_nowait()

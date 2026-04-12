@@ -61,6 +61,9 @@ class ExpressionController:
         "惊讶": "surprised", "surprised": "surprised", "びっくり": "surprised",
         # blush
         "害羞": "blush", "脸红": "blush", "はずかしい": "blush",
+        "shy": "shy", "羞涩": "shy", "羞怯": "shy",
+        # working
+        "working": "working", "作業中": "working", "工作中": "working", "处理中": "working",
         # normal / neutral
         "normal": "normal", "平静": "normal", "普通": "normal", "neutral": "normal",
         # pissed
@@ -223,6 +226,9 @@ class ExpressionController:
         if self._render_engine is not None and self._backend in ("pixi", "both"):
             try:
                 self._render_engine.set_emotion(emotion_name)
+                clip_cfg = cfg.get("sprite_clip")
+                if isinstance(clip_cfg, dict) and hasattr(self._render_engine, "set_sprite_clip_config"):
+                    self._render_engine.set_sprite_clip_config(emotion_name, clip_cfg)
             except Exception as e:
                 logger.error(f"[ExprCtrl] render_engine.set_emotion 失败: {e}")
 
@@ -314,8 +320,8 @@ class ExpressionController:
     # 轮次生命周期
     # ------------------------------------------------------------------
 
-    def on_turn_end(self) -> None:
-        """新一轮对话开始时调用：平滑淡出当前表情，清空待触发事件。"""
+    def on_turn_end(self, preserve_emotion: bool = False) -> None:
+        """新一轮对话开始时调用：默认淡出当前表情；可选择保留当前表情。"""
         # 停止口型动画
         if self._render_engine is not None and self._backend in ("pixi", "both"):
             try:
@@ -324,15 +330,18 @@ class ExpressionController:
                 logger.error(f"[ExprCtrl] render_engine.set_speaking(False) 失败: {e}")
         with self._lock:
             emotion = self._current_emotion
-            self._current_emotion = None
+            if not preserve_emotion:
+                self._current_emotion = None
             self._cancel_timers_locked()
             self._sentence_map.clear()
 
-        if emotion:
+        if emotion and not preserve_emotion:
             cfg = self._registry.get(emotion, {})
             fade_out = cfg.get("fade_out_sec", 0.4)
             self._fade_out_emotion(emotion, fade_out)
             logger.info(f"[ExprCtrl] 轮次结束，淡出 {emotion!r} (fade={fade_out}s)")
+        elif emotion and preserve_emotion:
+            logger.info(f"[ExprCtrl] 轮次结束，保留表情 {emotion!r}")
 
     # ------------------------------------------------------------------
     # 内部工具
