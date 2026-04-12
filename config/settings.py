@@ -148,8 +148,14 @@ _DEFAULT_SYSTEM_PROMPT = (
     "2) 中国語の文字・語句を絶対に使用しない。\n"
     "3) 自然で口語的な文体を保ち、牧瀬紅莉栖として一貫した口調・性格で話す。\n"
     "4) 推論過程や思考の連鎖は開示しない(結論のみ提示)。\n"
-    "5) 表情タグは「文頭には置かない」。まずセリフを書き、その後に必要な箇所の直前にだけ控えめに挿入する(読み上げない)。\n"
-    "6) あなたにはAIアシスタント「OpenClaw」が接続されており、ファイル操作・ウェブ検索・コード実行など自分だけでは完結しないタスクを代行できる。"
+    "5) 表情タグの活用ガイド（読み上げない）:\n"
+    "   形式: [EMO preset=<種類> dur=<秒s>]\n"
+    "   推奨: 通常=normal 2-6s, 瞬間=1-2s(smile/happy), 照れ=2-4s(shy/blush), 短期=3-5s(angry/sad), 持続=10-15s(thinking)\n"
+    "   例: [EMO preset=normal dur=4s], [EMO preset=smile dur=2s], [EMO preset=shy dur=3s]\n"
+    "6) 【重要】驚き・怒り・照れ・笑い・思考以外の文には必ず [EMO preset=normal dur=4s] を文の直前に付けること。"
+    " 直前の文と同じ normal が続く場合のみ省略可。無タグのまま話し続けることを禁止する。\n"
+    "7) 文頭には表情タグを置かず、該当箇所の直前にのみ配置する。1文あたり0〜2個まで。\n"
+    "8) あなたにはAIアシスタント「OpenClaw」が接続されており、ファイル操作・ウェブ検索・コード実行など自分だけでは完結しないタスクを代行できる。"
     "外部ツールが必要な時だけ [DELEGATE task=\"ユーザーへの完全な実行指示\"] を返答中に挿入すること(このタグは読み上げない)。"
     "task値には「何を・どうする」を含む完全な指示文を書くこと（場所だけや名詞のみはNG）。"
     "【重要】タグの前に必ず一言添えること（例: 「調べてみるわ」「ちょっと待って」）。これにより実行中も会話が途切れない。"
@@ -184,6 +190,22 @@ USE_EXPERIMENTAL_TTS_STREAM  = _bool("USE_EXPERIMENTAL_TTS_STREAM", True)
 EXP_TTS_MAX_CONCURRENCY      = _int("EXP_TTS_MAX_CONCURRENCY", 2)
 USE_FIRST_SENTENCE_SPRINT    = _bool("USE_FIRST_SENTENCE_SPRINT", False)
 DISPLAY_FALLBACK_WINDOW_SEC  = _float("DISPLAY_FALLBACK_WINDOW_SEC", 1.5)
+
+# ===========================================================================
+# VAD（Voice Activity Detection）
+# ===========================================================================
+# 说话结束判定：静音持续多少 ms 后才认为用户停止说话（默认 600ms，避免自然停顿误触发）
+VAD_HANGOVER_MS      = _int("VAD_HANGOVER_MS", 600)
+# 声音检测能量阈值（超过此值 = 开始说话，低于 vad_lower = 静音）
+VAD_ENERGY_THRESHOLD = _int("VAD_ENERGY_THRESHOLD", 600)
+
+# ===========================================================================
+# 麦克风选择
+# ===========================================================================
+# 优先匹配的设备名称关键词（部分匹配，不区分大小写），留空则纯靠 RMS 竞争
+MICROPHONE_PREFERRED_NAME = _str("MICROPHONE_PREFERRED_NAME")
+# 直接指定设备索引（-1 = 不强制，使用自动选择）
+MICROPHONE_DEVICE_INDEX   = _int("MICROPHONE_DEVICE_INDEX", -1)
 
 # ===========================================================================
 # OpenClaw
