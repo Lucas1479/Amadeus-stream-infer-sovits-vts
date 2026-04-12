@@ -5,8 +5,8 @@ import threading
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QTextEdit, QLabel, QScrollArea, QFrame, QSizePolicy,
                              QListWidget, QListWidgetItem, QMenu, QAction, QInputDialog,
-                             QPushButton, QDesktopWidget, QDoubleSpinBox, QCheckBox, QSlider)
-from PyQt5.QtCore import Qt, pyqtSignal, QSize, QObject, QTimer
+                             QPushButton, QDesktopWidget, QDoubleSpinBox, QCheckBox, QSlider, QSpinBox)
+from PyQt5.QtCore import Qt, pyqtSignal, QSize, QObject, QTimer, QPropertyAnimation, QEasingCurve, QRect
 from PyQt5.QtGui import QIcon, QFont, QColor, QCursor
 
 from qfluentwidgets import (FluentWindow, NavigationItemPosition, SubtitleLabel, setFont,
@@ -168,6 +168,9 @@ class ChatInterface(QWidget):
         self.asr_callback = asr_callback
         self.last_assistant_bubble = None
         self._render_engine = None
+        self._render_init_in_progress = False
+        self._render_warmup_scheduled = False
+        self._live2d_loaded = False
         self._panel_expanded = True
         self._render_mode = "vts"   # "vts" | "pixi"
         self.init_ui()
@@ -183,8 +186,11 @@ class ChatInterface(QWidget):
         self._char_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         char_layout = QVBoxLayout(self._char_container)
         char_layout.setContentsMargins(0, 0, 0, 0)
+        char_layout.setSpacing(0)
         self._char_container.hide()   # 默认 VTS 模式，角色区折叠
         root.addWidget(self._char_container, 1)
+        # Live2D 位置/大小控制条（WebView 插入后追加在末尾）
+        self._init_live2d_controls()
 
         # ── 右侧：聊天面板 ────────────────────────────────────────────────────
         self._chat_panel = QFrame(self)
@@ -257,6 +263,21 @@ class ChatInterface(QWidget):
         self._render_mode_btn.clicked.connect(self._toggle_render_mode)
         mb.addWidget(self._render_mode_btn)
 
+        # 表情预设抽屉按钮（右侧弹出面板）
+        self._emo_drawer_btn = TransparentToolButton(FIF.PALETTE, self.model_bar)
+        self._emo_drawer_btn.setToolTip("打开表情预设抽屉")
+        self._emo_drawer_btn.clicked.connect(self._toggle_emotion_drawer)
+        mb.addWidget(self._emo_drawer_btn)
+
+        # Pixi 子模式切换按钮（仅 pixi 模式下可见）
+        # sprite = 纯帧动画；hybrid = Live2D 待机 + 帧动画说话
+        self._pixi_submode = "sprite"   # "sprite" | "hybrid"
+        self._pixi_submode_btn = TransparentToolButton(FIF.PEOPLE, self.model_bar)
+        self._pixi_submode_btn.setToolTip("切换为 Live2D 混合模式（待机用 Live2D，说话用帧动画）")
+        self._pixi_submode_btn.clicked.connect(self._toggle_pixi_submode)
+        self._pixi_submode_btn.hide()   # 默认隐藏，切到 pixi 模式后显示
+        mb.addWidget(self._pixi_submode_btn)
+
         panel_layout.addWidget(self.model_bar)
 
         # ── 历史区（可折叠）──────────────────────────────────────────────────
@@ -311,29 +332,761 @@ class ChatInterface(QWidget):
 
         self.reload_sessions()
         self._sync_model_bar()
+        # 默认关闭启动期 WebEngine 预热：过早初始化可能导致 Fluent navbar/header 黑屏。
+        # 如需启用可手动设置 ENABLE_RENDER_WARMUP=1。
+        if os.environ.get("ENABLE_RENDER_WARMUP", "0") == "1":
+            self._schedule_render_warmup()
+
+    def _schedule_render_warmup(self):
+        """在 UI 空闲时预热渲染引擎（默认关闭，仅调试/实验启用）。"""
+        if self._render_engine is not None or self._render_warmup_scheduled:
+            return
+        self._render_warmup_scheduled = True
+        QTimer.singleShot(1800, self._warmup_render_engine)
+
+    def _warmup_render_engine(self):
+        self._render_warmup_scheduled = False
+        if self._render_engine is None and not self._render_init_in_progress:
+            self._init_render_engine()
 
     def _init_render_engine(self):
         """在 ChatInterface 内部启动渲染引擎并嵌入背景区（首次切换到 pixi 模式时懒加载）。"""
         import os
+        import logging as _log
+        _logger = _log.getLogger(__name__)
+        if self._render_engine is not None or self._render_init_in_progress:
+            return
+        self._render_init_in_progress = True
         try:
             from render.engine import RenderEngine
             engine = RenderEngine()
             # WebEngine 加载完成后强制 navbar repaint（OpenGL 初始化会使 navbar 变黑）
-            engine.on_ready = lambda: QTimer.singleShot(80, self._force_navbar_repaint)
+            def _navbar_repaint_safe():
+                win = self.window()
+                if hasattr(win, '_force_navbar_repaint_chain'):
+                    win._force_navbar_repaint_chain()
+                elif hasattr(win, '_force_navbar_repaint'):
+                    win._force_navbar_repaint()
+            # WebEngine 首次创建后做多次延迟刷新，规避加载时序导致的黑色导航栏残留。
+            def _on_renderer_ready():
+                QTimer.singleShot(80, _navbar_repaint_safe)
+                # 渲染器就绪后将所有已标定的对齐 profile 推送到 JS，
+                # 确保会话中 set_emotion() 触发的表情使用正确的位置/缩放/锁定。
+                QTimer.singleShot(400, self._push_all_align_profiles_to_renderer)
+                # 推送口型同步配置（需在 align profiles 之后，留出帧加载时间）
+                QTimer.singleShot(800, self._push_mouth_configs_to_renderer)
+            engine.on_ready = _on_renderer_ready
             widget = engine.start()
-            self._char_container.layout().addWidget(widget)
+            # 插入到控制条前面（索引 0）
+            self._char_container.layout().insertWidget(0, widget)
             self._render_engine = engine
             images_dir = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)), "render", "assets", "images"
             )
             if os.path.isdir(images_dir):
                 engine.load_kur1or3_sprites(images_dir)
+            # Live2D 模型改为按需加载（hybrid 子模式才加载），降低首次切换卡顿。
+            self._live2d_loaded = False
+            # 用保存的布局初始化控制条数值
+            self._restore_live2d_controls()
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning(f"[ChatInterface] 渲染引擎初始化失败: {e}")
+            _logger.warning(f"[ChatInterface] 渲染引擎初始化失败: {e}")
+        finally:
+            self._render_init_in_progress = False
 
     def engine(self):
         return self._render_engine
+
+    def _ensure_live2d_loaded(self) -> bool:
+        """在需要 hybrid 时按需加载 Live2D，失败时返回 False。"""
+        import logging as _log
+        _logger = _log.getLogger(__name__)
+        if self._render_engine is None:
+            return False
+        if self._live2d_loaded:
+            return True
+        try:
+            self._render_engine.load_kurisu_model()
+            self._live2d_loaded = True
+            _logger.info("[ChatInterface] Live2D 模型按需加载完成")
+            return True
+        except Exception as _live2d_err:
+            _logger.warning(f"[ChatInterface] Live2D 模型按需加载失败（回退纯帧动画）: {_live2d_err}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Live2D 位置 / 大小 控制条
+    # ------------------------------------------------------------------
+
+    def _init_live2d_controls(self):
+        """在字符区底部创建 Live2D 变换控制条（位置偏移 + 缩放）。"""
+        from PyQt5.QtWidgets import QHBoxLayout, QLabel, QFrame, QDoubleSpinBox, QSpinBox, QCheckBox
+
+        bar = QFrame(self._char_container)
+        bar.setFixedHeight(72)
+        bar.setStyleSheet(
+            "QFrame { background: rgba(18,18,18,210); border-top: 1px solid #3a3a3a; }"
+            "QLabel { color: #aaa; font-size: 11px; background: transparent; border: none; }"
+            "QDoubleSpinBox, QSpinBox {"
+            "  background: #2b2b2b; color: #ddd; border: 1px solid #4a4a4a;"
+            "  border-radius: 3px; padding: 1px 3px; font-size: 11px; }"
+            "QDoubleSpinBox:focus, QSpinBox:focus { border: 1px solid #666; }"
+        )
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(10, 0, 10, 0)
+        layout.setSpacing(6)
+
+        # 缩放
+        layout.addWidget(QLabel("缩放:", bar))
+        self._l2d_scale = QDoubleSpinBox(bar)
+        self._l2d_scale.setRange(0.2, 5.0)
+        self._l2d_scale.setSingleStep(0.05)
+        self._l2d_scale.setDecimals(2)
+        self._l2d_scale.setValue(1.0)
+        self._l2d_scale.setFixedWidth(72)
+        self._l2d_scale.setToolTip("Live2D 模型缩放倍率（默认 1.00）\n也可在角色区用鼠标滚轮调节")
+        layout.addWidget(self._l2d_scale)
+
+        layout.addWidget(QLabel("X:", bar))
+        self._l2d_x = QSpinBox(bar)
+        self._l2d_x.setRange(-2000, 2000)
+        self._l2d_x.setValue(0)
+        self._l2d_x.setFixedWidth(68)
+        self._l2d_x.setToolTip("Live2D 模型水平偏移（像素）\n也可在角色区直接拖拽模型")
+        layout.addWidget(self._l2d_x)
+
+        layout.addWidget(QLabel("Y:", bar))
+        self._l2d_y = QSpinBox(bar)
+        self._l2d_y.setRange(-2000, 2000)
+        self._l2d_y.setValue(0)
+        self._l2d_y.setFixedWidth(68)
+        self._l2d_y.setToolTip("Live2D 模型垂直偏移（像素，正数向下）\n也可在角色区直接拖拽模型")
+        layout.addWidget(self._l2d_y)
+
+        sep = QLabel(" | ", bar)
+        sep.setStyleSheet("color:#666;")
+        layout.addWidget(sep)
+
+        layout.addWidget(QLabel("表情缩放:", bar))
+        self._expr_scale = QDoubleSpinBox(bar)
+        self._expr_scale.setRange(0.2, 5.0)
+        self._expr_scale.setSingleStep(0.05)
+        self._expr_scale.setDecimals(2)
+        self._expr_scale.setValue(1.0)
+        self._expr_scale.setFixedWidth(72)
+        self._expr_scale.setToolTip("Sprite 表情层缩放倍率（1.00 为默认）")
+        layout.addWidget(self._expr_scale)
+
+        layout.addWidget(QLabel("表情X:", bar))
+        self._expr_x = QDoubleSpinBox(bar)
+        self._expr_x.setRange(-2000.0, 2000.0)
+        self._expr_x.setSingleStep(0.1)
+        self._expr_x.setDecimals(2)
+        self._expr_x.setValue(0.0)
+        self._expr_x.setFixedWidth(78)
+        self._expr_x.setToolTip("Sprite 表情层水平偏移（像素）")
+        layout.addWidget(self._expr_x)
+
+        layout.addWidget(QLabel("表情Y:", bar))
+        self._expr_y = QDoubleSpinBox(bar)
+        self._expr_y.setRange(-2000.0, 2000.0)
+        self._expr_y.setSingleStep(0.1)
+        self._expr_y.setDecimals(2)
+        self._expr_y.setValue(0.0)
+        self._expr_y.setFixedWidth(78)
+        self._expr_y.setToolTip("Sprite 表情层垂直偏移（像素，正数向下）")
+        layout.addWidget(self._expr_y)
+
+        layout.addWidget(QLabel("底线:", bar))
+        self._expr_baseline = QDoubleSpinBox(bar)
+        self._expr_baseline.setRange(-500.0, 500.0)
+        self._expr_baseline.setSingleStep(0.1)
+        self._expr_baseline.setDecimals(2)
+        self._expr_baseline.setValue(0.0)
+        self._expr_baseline.setFixedWidth(78)
+        self._expr_baseline.setToolTip("底部有效图形基线偏移（像素，正数向上）")
+        layout.addWidget(self._expr_baseline)
+
+        self._expr_marker_chk = QCheckBox("显示标注", bar)
+        self._expr_marker_chk.setStyleSheet("QCheckBox { color:#aaa; font-size:11px; }")
+        self._expr_marker_chk.setToolTip("显示/隐藏底部基线标注")
+        layout.addWidget(self._expr_marker_chk)
+
+        self._expr_lock_chk = QCheckBox("锁定Live2D", bar)
+        self._expr_lock_chk.setStyleSheet("QCheckBox { color:#aaa; font-size:11px; }")
+        self._expr_lock_chk.setToolTip("开启后，Live2D 的移动/缩放会联动到表情层")
+        layout.addWidget(self._expr_lock_chk)
+        self._expr_lock_chk.hide()  # 锁定入口迁移到右侧预设栏
+
+        self._import_anchor_btn = TransparentToolButton(FIF.DOWNLOAD, bar)
+        self._import_anchor_btn.setToolTip(
+            "从 align_meta.json 导入纹理锚点\n"
+            "激活后 Sprite 自动跟随 Live2D，X/Y 变为微调偏移"
+        )
+        self._import_anchor_btn.clicked.connect(self._import_anchor_from_meta)
+        layout.addWidget(self._import_anchor_btn)
+
+        layout.addStretch(1)
+
+        reset_btn = TransparentToolButton(FIF.SYNC, bar)
+        reset_btn.setToolTip("重置到默认位置（居中 / 1.0 缩放）")
+        reset_btn.clicked.connect(self._reset_live2d_transform)
+        layout.addWidget(reset_btn)
+
+        save_btn = TransparentToolButton(FIF.SAVE, bar)
+        save_btn.setToolTip("将当前位置保存为默认值（下次启动自动应用）")
+        save_btn.clicked.connect(self._save_live2d_layout)
+        layout.addWidget(save_btn)
+
+        self._l2d_scale.valueChanged.connect(self._on_live2d_transform_changed)
+        self._l2d_x.valueChanged.connect(self._on_live2d_transform_changed)
+        self._l2d_y.valueChanged.connect(self._on_live2d_transform_changed)
+        self._expr_scale.valueChanged.connect(self._on_expr_transform_changed)
+        self._expr_x.valueChanged.connect(self._on_expr_transform_changed)
+        self._expr_y.valueChanged.connect(self._on_expr_transform_changed)
+        self._expr_baseline.valueChanged.connect(self._on_expr_transform_changed)
+        self._expr_marker_chk.stateChanged.connect(self._on_expr_transform_changed)
+        self._expr_lock_chk.stateChanged.connect(self._on_expr_lock_changed)
+
+        self._live2d_controls_bar = bar
+        self._char_container.layout().addWidget(bar)
+        bar.hide()  # pixi 模式激活后才显示
+
+    def _restore_live2d_controls(self):
+        """引擎初始化后，将已保存的布局参数填入控制条。"""
+        if self._render_engine is None:
+            return
+        layout = self._render_engine.load_saved_live2d_layout()
+        if not layout:
+            return
+        self._l2d_scale.blockSignals(True)
+        self._l2d_x.blockSignals(True)
+        self._l2d_y.blockSignals(True)
+        self._l2d_scale.setValue(layout.get("scale_factor", 1.0))
+        self._l2d_x.setValue(int(layout.get("offset_x", 0)))
+        self._l2d_y.setValue(int(layout.get("offset_y", 0)))
+        self._l2d_scale.blockSignals(False)
+        self._l2d_x.blockSignals(False)
+        self._l2d_y.blockSignals(False)
+
+    def _sprite_align_profiles_path(self):
+        from pathlib import Path
+        return Path(os.path.dirname(os.path.abspath(__file__))) / "config" / "sprite_align_profiles.json"
+
+    def _push_mouth_configs_to_renderer(self):
+        """启动时将 config/mouth_masks.json 推送到 JS 渲染层，并绑定振幅回调。"""
+        import json as _json
+        import logging as _log
+        _logger = _log.getLogger(__name__)
+        if self._render_engine is None:
+            return
+        mouth_path = self._sprite_align_profiles_path().parent / "mouth_masks.json"
+        if not mouth_path.exists():
+            _logger.info("[MouthInit] mouth_masks.json 不存在，跳过口型同步初始化（先运行 tools/detect_mouth_masks.py）")
+            return
+        try:
+            data = _json.loads(mouth_path.read_text(encoding="utf-8"))
+            expressions = data.get("expressions", {})
+            for sprite_name, cfg in expressions.items():
+                js_cfg = {
+                    "cx":             cfg.get("cx", 0),
+                    "cy":             cfg.get("cy", 0),
+                    "width":          cfg.get("width", 40),
+                    "height":         cfg.get("height", 20),
+                    "curve":          cfg.get("curve", 0),
+                    "closedFrameIdx": cfg.get("closed_frame_idx", 0),
+                    "openFrameIdx":   cfg.get("open_frame_idx", 0),
+                    "openness":       cfg.get("openness", []),
+                }
+                self._render_engine.load_mouth_config(sprite_name, js_cfg)
+            _logger.info(f"[MouthInit] 已推送 {len(expressions)} 个口型配置到渲染层")
+        except Exception as e:
+            _logger.warning(f"[MouthInit] 加载 mouth_masks.json 失败: {e}")
+
+        # 绑定振幅路由：VTS send_mouth_data → render_engine.set_mouth_value
+        try:
+            win = self.window()
+            vts_mgr = getattr(win, "_vts_manager", None) if win else None
+            if vts_mgr is None:
+                # 尝试从 main 模块获取
+                import sys
+                main_mod = sys.modules.get("__main__")
+                vts_mgr = getattr(main_mod, "vts_manager", None)
+            if vts_mgr is not None and hasattr(vts_mgr, "on_mouth_value"):
+                engine_ref = self._render_engine
+                vts_mgr.on_mouth_value = lambda v, e=engine_ref: e.set_mouth_value(v)
+                _logger.info("[MouthInit] 振幅回调已绑定到渲染引擎")
+        except Exception as e:
+            _logger.warning(f"[MouthInit] 振幅回调绑定失败: {e}")
+
+    def _push_all_align_profiles_to_renderer(self):
+        """启动时将 sprite_align_profiles.json 中所有 profile 推送到 JS 渲染层。
+
+        JS 渲染器每次启动时 per-emotion 变换状态从默认值开始（offsetX=0, offsetY=0, scale=1）。
+        只有通过测试面板手动选择 preset 时，_on_expr_transform_changed() 才会推送正确数值。
+        会话中 set_emotion() 只发送 setEmotion 指令，不推送变换——因此不调用本方法时位置错位。
+        此处在渲染器 ready 后统一推送，使会话触发的表情也能使用已标定的位置。
+        """
+        if self._render_engine is None:
+            return
+        import logging as _log
+        _logger = _log.getLogger(__name__)
+        data = self._read_sprite_align_profiles()
+        profiles = data.get("profiles", {})
+        if not profiles:
+            return
+        pushed = 0
+        for key, prof in profiles.items():
+            try:
+                self._render_engine.set_sprite_align_transform(
+                    offset_x=float(prof.get("offset_x", 0)),
+                    offset_y=float(prof.get("offset_y", 0)),
+                    scale_mul=float(prof.get("scale_mul", 1.0)),
+                    baseline_offset_px=float(prof.get("baseline_offset_px", 0)),
+                    show_baseline=bool(prof.get("show_baseline", False)),
+                    emotion=key,
+                )
+            except Exception as e:
+                _logger.warning(f"[AlignInit] set_sprite_align_transform({key}) 失败: {e}")
+                continue
+            if (
+                prof.get("lock_to_live2d")
+                and prof.get("lock_dx") is not None
+                and prof.get("texture_cx") is None   # 锚点模式不需要 delta
+                and hasattr(self._render_engine, "set_sprite_align_lock_delta")
+            ):
+                try:
+                    self._render_engine.set_sprite_align_lock_delta(
+                        dx=float(prof["lock_dx"]),
+                        dy=float(prof.get("lock_dy", 0)),
+                        ds=float(prof.get("lock_ds", 1.0)),
+                        lock_s=float(prof.get("lock_lock_s", 1.0)),
+                        emotion=key,
+                    )
+                except Exception as e:
+                    _logger.warning(f"[AlignInit] set_sprite_align_lock_delta({key}) 失败: {e}")
+            if prof.get("lock_to_live2d") and hasattr(self._render_engine, "set_sprite_align_lock_to_live2d"):
+                try:
+                    self._render_engine.set_sprite_align_lock_to_live2d(True, emotion=key)
+                except Exception as e:
+                    _logger.warning(f"[AlignInit] set_sprite_align_lock_to_live2d({key}) 失败: {e}")
+            pushed += 1
+        _logger.info(f"[AlignInit] 已推送 {pushed}/{len(profiles)} 个对齐 profile 到渲染层")
+
+    def _current_expr_profile_name(self) -> str:
+        win = self.window()
+        epi = getattr(win, "emotionPresetsInterface", None) if win else None
+        name = getattr(epi, "_current_preset", None)
+        if name:
+            return str(name).strip()
+        return "normal"
+
+    def get_expr_lock_state_for_emotion(self, emotion: str) -> bool:
+        prof = self._load_expr_profile(emotion)
+        return bool(prof.get("lock_to_live2d", False)) if isinstance(prof, dict) else False
+
+    def set_expr_lock_state_for_current_emotion(self, locked: bool):
+        if getattr(self, "_expr_lock_chk", None) is None:
+            return
+        self._expr_lock_chk.blockSignals(True)
+        self._expr_lock_chk.setChecked(bool(locked))
+        self._expr_lock_chk.blockSignals(False)
+        self._on_expr_lock_changed(Qt.Checked if bool(locked) else Qt.Unchecked)
+
+    def _is_current_emotion_anchor_mode(self) -> bool:
+        """当前表情是否处于锚点感知模式（有 texture_cx/texture_feet_y 元数据）。"""
+        emotion = self._current_expr_profile_name()
+        prof = self._load_expr_profile(emotion)
+        return isinstance(prof, dict) and prof.get("texture_cx") is not None
+
+    def _update_expr_transform_controls_enabled(self):
+        locked = bool(getattr(self, "_expr_lock_chk", None) is not None and self._expr_lock_chk.isChecked())
+        # 锚点感知模式下，X/Y/Scale 始终可调（它们是微调偏移，不是绝对位置）
+        if locked and self._is_current_emotion_anchor_mode():
+            locked = False
+        for w in (self._expr_scale, self._expr_x, self._expr_y, self._expr_baseline):
+            if w is not None:
+                w.setEnabled(not locked)
+
+    def _read_sprite_align_profiles(self) -> dict:
+        import json
+        p = self._sprite_align_profiles_path()
+        try:
+            if not p.exists():
+                return {}
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {}
+
+    def _write_sprite_align_profiles(self, data: dict):
+        import json
+        p = self._sprite_align_profiles_path()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _profile_from_expr_controls(self) -> dict:
+        return {
+            "offset_x": float(self._expr_x.value()),
+            "offset_y": float(self._expr_y.value()),
+            "scale_mul": float(self._expr_scale.value()),
+            "baseline_offset_px": float(self._expr_baseline.value()),
+            "show_baseline": bool(self._expr_marker_chk.isChecked()),
+            "lock_to_live2d": bool(self._expr_lock_chk.isChecked()),
+        }
+
+    def _save_expr_profile_data(self, emotion: str, prof: dict):
+        key = str(emotion or "").strip() or "normal"
+        data = self._read_sprite_align_profiles()
+        profiles = data.get("profiles")
+        if not isinstance(profiles, dict):
+            profiles = {}
+            data["profiles"] = profiles
+        profiles[key] = dict(prof or {})
+        self._write_sprite_align_profiles(data)
+
+    def _apply_expr_profile_to_controls(self, prof: dict):
+        if not isinstance(prof, dict):
+            return
+        self._expr_scale.blockSignals(True)
+        self._expr_x.blockSignals(True)
+        self._expr_y.blockSignals(True)
+        self._expr_baseline.blockSignals(True)
+        self._expr_marker_chk.blockSignals(True)
+        self._expr_lock_chk.blockSignals(True)
+        self._expr_scale.setValue(float(prof.get("scale_mul", 1.0)))
+        self._expr_x.setValue(int(prof.get("offset_x", 0)))
+        self._expr_y.setValue(int(prof.get("offset_y", 0)))
+        self._expr_baseline.setValue(int(prof.get("baseline_offset_px", 0)))
+        self._expr_marker_chk.setChecked(bool(prof.get("show_baseline", False)))
+        self._expr_lock_chk.setChecked(bool(prof.get("lock_to_live2d", False)))
+        self._expr_scale.blockSignals(False)
+        self._expr_x.blockSignals(False)
+        self._expr_y.blockSignals(False)
+        self._expr_baseline.blockSignals(False)
+        self._expr_marker_chk.blockSignals(False)
+        self._expr_lock_chk.blockSignals(False)
+
+    def _save_current_expr_profile(self, emotion: str):
+        self._save_expr_profile_data(emotion, self._profile_from_expr_controls())
+
+    def _load_expr_profile(self, emotion: str) -> dict | None:
+        key = str(emotion or "").strip() or "normal"
+        data = self._read_sprite_align_profiles()
+        profiles = data.get("profiles")
+        if not isinstance(profiles, dict):
+            return None
+        prof = profiles.get(key)
+        return prof if isinstance(prof, dict) else None
+
+    def persist_expr_profile_from_renderer(self, emotion: str):
+        """把渲染层当前对齐值落盘，避免鼠标拖拽/缩放后切预设丢失。"""
+        if self._render_engine is None or not emotion:
+            return
+        lock_state = self.get_expr_lock_state_for_emotion(emotion)
+
+        def _on_result(result):
+            if not isinstance(result, dict):
+                return
+            prof = {
+                "offset_x": float(result.get("offsetX", 0)),
+                "offset_y": float(result.get("offsetY", 0)),
+                "scale_mul": float(result.get("scaleMul", 1.0)),
+                "baseline_offset_px": float(result.get("baselineOffsetPx", 0)),
+                "show_baseline": bool(result.get("showBaseline", False)),
+                "lock_to_live2d": bool(lock_state),
+            }
+            # 保留纹理锚点元数据（锚点感知模式下由后处理脚本写入，不应被覆盖）
+            if result.get("textureCx") is not None:
+                prof["texture_cx"] = float(result["textureCx"])
+            if result.get("textureFeetY") is not None:
+                prof["texture_feet_y"] = float(result["textureFeetY"])
+            # 持久化 delta（旧 delta 锁定模式）：重启后可直接注入，无需重新捕获
+            if result.get("_lockDx") is not None:
+                prof["lock_dx"] = float(result["_lockDx"])
+                prof["lock_dy"] = float(result.get("_lockDy", 0))
+                prof["lock_ds"] = float(result.get("_lockDs", 1.0))
+                prof["lock_lock_s"] = float(result.get("_lockLockS", 1.0))
+            self._save_expr_profile_data(emotion, prof)
+
+        try:
+            self._render_engine.get_sprite_align_transform(_on_result, emotion=emotion)
+        except Exception:
+            pass
+
+    def on_emotion_preset_selected(self, emotion: str):
+        """抽屉切换 preset 时，恢复该表情独立的对齐/锁定配置。"""
+        key = str(emotion or "").strip() or "normal"
+        prof = self._load_expr_profile(key)
+        if prof:
+            self._apply_expr_profile_to_controls(prof)
+        else:
+            self._apply_expr_profile_to_controls(
+                {
+                    "offset_x": 0,
+                    "offset_y": 0,
+                    "scale_mul": 1.0,
+                    "baseline_offset_px": 0,
+                    "show_baseline": False,
+                    "lock_to_live2d": False,
+                }
+            )
+        if self._render_engine is None:
+            return
+        # 先应用对齐，再应用该 emotion 的锁定状态
+        self._on_expr_transform_changed()
+        self._on_expr_lock_changed(Qt.Checked if self._expr_lock_chk.isChecked() else Qt.Unchecked)
+        self._update_expr_transform_controls_enabled()
+        # 若 profile 含纹理锚点元数据，一并发送到渲染层（激活锚点感知模式）
+        if prof and prof.get("texture_cx") is not None and prof.get("texture_feet_y") is not None:
+            try:
+                self._render_engine.set_sprite_align_transform(
+                    offset_x=float(prof.get("offset_x", 0)),
+                    offset_y=float(prof.get("offset_y", 0)),
+                    scale_mul=float(prof.get("scale_mul", 1.0)),
+                    texture_cx=float(prof["texture_cx"]),
+                    texture_feet_y=float(prof["texture_feet_y"]),
+                    emotion=key,
+                )
+            except Exception:
+                pass
+        # 若 profile 含持久化 delta（旧 delta 锁定模式），注入到渲染层（覆盖 onModelLoaded 的捕获）
+        if (
+            prof
+            and prof.get("lock_to_live2d")
+            and prof.get("lock_dx") is not None
+            and prof.get("texture_cx") is None  # 锚点模式不需要 delta
+            and hasattr(self._render_engine, "set_sprite_align_lock_delta")
+        ):
+            try:
+                self._render_engine.set_sprite_align_lock_delta(
+                    dx=float(prof["lock_dx"]),
+                    dy=float(prof.get("lock_dy", 0)),
+                    ds=float(prof.get("lock_ds", 1.0)),
+                    lock_s=float(prof.get("lock_lock_s", 1.0)),
+                    emotion=key,
+                )
+            except Exception:
+                pass
+
+    def _on_live2d_transform_changed(self):
+        """控制条数值变更时同步到 JS。"""
+        if self._render_engine is None:
+            return
+        self._render_engine.set_live2d_transform(
+            self._l2d_x.value(),
+            self._l2d_y.value(),
+            self._l2d_scale.value(),
+        )
+
+    def _on_expr_lock_changed(self, _state):
+        if getattr(self, "_expr_lock_chk", None) is None:
+            return
+        emotion = self._current_expr_profile_name()
+        if self._render_engine is not None and hasattr(self._render_engine, "set_sprite_align_lock_to_live2d"):
+            try:
+                if self._expr_lock_chk.isChecked():
+                    self._render_engine.set_sprite_align_lock_to_live2d(True, emotion=emotion)
+                else:
+                    # 解锁时同时覆盖两种目标：
+                    # 1) 当前右侧预设
+                    # 2) 当前渲染层实际显示情绪（emotion 省略时由前端用 currentEmotion）
+                    # 避免"预设与当前显示不同步"导致看似已解锁但仍不可调。
+                    self._render_engine.set_sprite_align_lock_to_live2d(False, emotion=emotion)
+            except Exception:
+                pass
+        self._update_expr_transform_controls_enabled()
+        self._save_current_expr_profile(emotion)
+        # 锁定时额外从 JS 读取真实位置写回 JSON：
+        # canvas 拖拽只更新 JS 状态，不更新 Python 滑条；
+        # _save_current_expr_profile 从滑条读取，值可能是旧的；
+        # persist_expr_profile_from_renderer 直接读 JS，覆盖写入正确的 offsetX/offsetY。
+        if self._expr_lock_chk.isChecked():
+            self.persist_expr_profile_from_renderer(emotion)
+
+    def _on_expr_transform_changed(self, *_args):
+        """表情层变换（位置/缩放/基线标注）同步到 JS。"""
+        emotion = self._current_expr_profile_name()
+        if self._render_engine is None:
+            self._save_current_expr_profile(emotion)
+            return
+        try:
+            self._render_engine.set_sprite_align_transform(
+                offset_x=self._expr_x.value(),
+                offset_y=self._expr_y.value(),
+                scale_mul=self._expr_scale.value(),
+                baseline_offset_px=self._expr_baseline.value(),
+                show_baseline=self._expr_marker_chk.isChecked(),
+                emotion=emotion,
+            )
+        except Exception:
+            pass
+        self._save_current_expr_profile(emotion)
+
+    def _import_anchor_from_meta(self):
+        """从后处理输出的 align_meta.json 导入纹理锚点元数据，激活锚点感知模式。"""
+        import json as _json
+        from pathlib import Path
+        from PyQt5.QtWidgets import QMessageBox
+
+        emotion = self._current_expr_profile_name()
+        # 与 engine._PRESET_TO_SPRITE 保持一致的映射
+        _SPRITE_MAP = {
+            "smile": "happy", "thinking": "sided_thinking",
+            "surprised": "sided_surprised", "blush": "shy",
+        }
+        sprite_name = _SPRITE_MAP.get(emotion, emotion)
+
+        project_root = Path(os.path.dirname(os.path.abspath(__file__)))
+        meta_path = project_root / "render" / "assets" / "images" / sprite_name / "align_meta.json"
+
+        if not meta_path.exists():
+            QMessageBox.warning(
+                self, "找不到元数据",
+                f"未找到：\n{meta_path}\n\n"
+                f"请先对「{sprite_name}」帧序列运行 postprocess_shy_align.py。"
+            )
+            return
+
+        try:
+            meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+            tcx = float(meta["texture_cx"])
+            tfy = float(meta["texture_feet_y"])
+        except Exception as e:
+            QMessageBox.critical(self, "元数据读取失败", f"读取 align_meta.json 失败：\n{e}")
+            return
+
+        # 更新 profile，保留其他字段，重置微调偏移（旧手动偏移已无意义）
+        prof = self._load_expr_profile(emotion) or {}
+        prof["texture_cx"] = tcx
+        prof["texture_feet_y"] = tfy
+        prof["offset_x"] = 0.0
+        prof["offset_y"] = 0.0
+        self._save_expr_profile_data(emotion, prof)
+
+        # 同步控件
+        self._expr_x.blockSignals(True)
+        self._expr_y.blockSignals(True)
+        self._expr_x.setValue(0.0)
+        self._expr_y.setValue(0.0)
+        self._expr_x.blockSignals(False)
+        self._expr_y.blockSignals(False)
+
+        # 发送到渲染层，立即生效
+        if self._render_engine is not None:
+            try:
+                self._render_engine.set_sprite_align_transform(
+                    offset_x=0.0,
+                    offset_y=0.0,
+                    scale_mul=float(prof.get("scale_mul", 1.0)),
+                    texture_cx=tcx,
+                    texture_feet_y=tfy,
+                    emotion=emotion,
+                )
+            except Exception:
+                pass
+
+        QMessageBox.information(
+            self, "锚点导入成功",
+            f"「{emotion}」已切换到锚点感知模式\n"
+            f"texture_cx={tcx:.1f}  texture_feet_y={tfy:.1f}\n\n"
+            f"X/Y 偏移已重置为 0，可用滑条做微调后保存。"
+        )
+
+    def _reset_live2d_transform(self):
+        """重置控制条并通知 JS 归位。"""
+        self._l2d_scale.blockSignals(True)
+        self._l2d_x.blockSignals(True)
+        self._l2d_y.blockSignals(True)
+        self._l2d_scale.setValue(1.0)
+        self._l2d_x.setValue(0)
+        self._l2d_y.setValue(0)
+        self._l2d_scale.blockSignals(False)
+        self._l2d_x.blockSignals(False)
+        self._l2d_y.blockSignals(False)
+        if self._render_engine is not None:
+            self._render_engine.reset_live2d_transform()
+        if getattr(self, "_expr_lock_chk", None) is not None and self._expr_lock_chk.isChecked():
+            self._on_expr_lock_changed(Qt.Checked)
+
+    def _save_live2d_layout(self):
+        """读取 JS 当前实际变换值（含拖拽偏移），保存并同步控制条。"""
+        if self._render_engine is None:
+            return
+
+        def _on_result(result):
+            if not result:
+                return
+            ox  = result.get("offsetX", 0)
+            oy  = result.get("offsetY", 0)
+            sf  = result.get("scaleFactor", 1.0)
+            self._render_engine.save_live2d_layout(ox, oy, sf)
+            # 同步控制条，防止拖拽后数值与 JS 不一致
+            self._l2d_scale.blockSignals(True)
+            self._l2d_x.blockSignals(True)
+            self._l2d_y.blockSignals(True)
+            self._l2d_scale.setValue(float(sf))
+            self._l2d_x.setValue(int(ox))
+            self._l2d_y.setValue(int(oy))
+            self._l2d_scale.blockSignals(False)
+            self._l2d_x.blockSignals(False)
+            self._l2d_y.blockSignals(False)
+            if getattr(self, "_expr_lock_chk", None) is not None and self._expr_lock_chk.isChecked():
+                self._on_expr_lock_changed(Qt.Checked)
+
+        self._render_engine.get_live2d_transform(_on_result)
+
+    def _apply_pixi_submode(self):
+        """将当前 _pixi_submode 应用到渲染引擎。"""
+        if self._render_engine is None:
+            return
+        if self._pixi_submode == "hybrid":
+            if self._ensure_live2d_loaded():
+                self._render_engine.set_hybrid_mode()
+            else:
+                # Live2D 加载失败时自动回退，避免模式切换进入无效状态
+                self._pixi_submode = "sprite"
+                self._pixi_submode_btn.setIcon(FIF.PEOPLE)
+                self._pixi_submode_btn.setToolTip("切换为 Live2D 混合模式（待机用 Live2D，说话用帧动画）")
+                self._render_engine.set_mode("sprite")
+        else:
+            self._render_engine.set_mode("sprite")
+
+    def _switch_to_pixi_backend(self):
+        """异步完成 Pixi 后端绑定，减少点击回调中的同步阻塞。"""
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+        from vts.expression_controller import get_controller
+        ctrl = get_controller()
+        try:
+            if self._render_engine is None:
+                self._init_render_engine()
+            if self._render_engine is not None:
+                ctrl.set_render_engine(self._render_engine, backend="pixi")
+                self._apply_pixi_submode()
+                _log.info(f"[ChatInterface] 切换到 PixiJS 渲染模式（子模式: {self._pixi_submode}）")
+        finally:
+            self._render_mode_btn.setEnabled(True)
+
+    def _toggle_pixi_submode(self):
+        """在 sprite 和 hybrid 子模式之间切换。"""
+        import logging as _log
+        _logger = _log.getLogger(__name__)
+        if self._pixi_submode == "sprite":
+            self._pixi_submode = "hybrid"
+            self._pixi_submode_btn.setIcon(FIF.PHOTO)
+            self._pixi_submode_btn.setToolTip("当前：Live2D 混合模式 — 点击切换回纯帧动画")
+        else:
+            self._pixi_submode = "sprite"
+            self._pixi_submode_btn.setIcon(FIF.PEOPLE)
+            self._pixi_submode_btn.setToolTip("切换为 Live2D 混合模式（待机用 Live2D，说话用帧动画）")
+        self._apply_pixi_submode()
+        _logger.info(f"[ChatInterface] Pixi 子模式切换为: {self._pixi_submode}")
 
     def _toggle_panel(self):
         self._panel_expanded = not self._panel_expanded
@@ -344,6 +1097,11 @@ class ChatInterface(QWidget):
         else:
             self._toggle_btn.setIcon(FIF.RIGHT_ARROW)
             self._toggle_btn.setToolTip("展开历史记录")
+
+    def _toggle_emotion_drawer(self):
+        win = self.window()
+        if win and hasattr(win, "toggle_emotion_drawer"):
+            win.toggle_emotion_drawer()
 
     def _toggle_render_mode(self):
         """在 VTS 渲染 和 PixiJS 角色渲染 之间切换。"""
@@ -360,13 +1118,22 @@ class ChatInterface(QWidget):
             self._render_mode_btn.setToolTip("切换到 VTS 渲染")
             # 清除 VTS 当前表情状态（避免 VTS 持续渲染旧表情）
             ctrl.on_turn_end()
-            # 首次激活时懒加载渲染引擎
+            # 暂停 VTS 心跳与动作队列（PixiJS 模式下不需要）
+            try:
+                from vts.action import set_paused as _vts_set_paused
+                _vts_set_paused(True)
+            except Exception as _e:
+                _log.warning(f"[ChatInterface] VTS 心跳暂停失败: {_e}")
+            # 切换 backend → pixi 并应用当前子模式。
+            # 若需要首次初始化，用 singleShot 把重活移出点击回调，降低"点一下就卡住"的体感。
             if self._render_engine is None:
-                self._init_render_engine()
-            # 切换 backend → pixi
-            if self._render_engine is not None:
-                ctrl.set_render_engine(self._render_engine, backend="pixi")
-                _log.info("[ChatInterface] 切换到 PixiJS 渲染模式")
+                self._render_mode_btn.setEnabled(False)
+                QTimer.singleShot(0, self._switch_to_pixi_backend)
+            else:
+                self._switch_to_pixi_backend()
+            # 显示子模式切换按钮 & Live2D 控制条
+            self._pixi_submode_btn.show()
+            self._live2d_controls_bar.show()
         else:
             self._render_mode = "vts"
             self._char_container.hide()
@@ -375,6 +1142,15 @@ class ChatInterface(QWidget):
             self._chat_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             self._render_mode_btn.setIcon(FIF.VIDEO)
             self._render_mode_btn.setToolTip("切换到角色渲染视图 (PixiJS)")
+            # 隐藏子模式按钮 & Live2D 控制条
+            self._pixi_submode_btn.hide()
+            self._live2d_controls_bar.hide()
+            # 恢复 VTS 心跳与动作队列
+            try:
+                from vts.action import set_paused as _vts_set_paused
+                _vts_set_paused(False)
+            except Exception as _e:
+                _log.warning(f"[ChatInterface] VTS 心跳恢复失败: {_e}")
             # 停止口型动画
             if self._render_engine is not None:
                 try:
@@ -1109,6 +1885,11 @@ class LiveApiFloatButton(QWidget):
         self._btn = QPushButton("⚪  LIVE", self)
         self._btn.setFixedSize(110, 38)
         self._btn.clicked.connect(self._on_click)
+        self._btn.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._btn.customContextMenuRequested.connect(
+            lambda pos: self._show_mic_menu(self._btn.mapToGlobal(pos))
+        )
+        self._btn.setToolTip("左键：开关 Live API\n右键：选择麦克风")
         self._apply_style(False)
         layout.addWidget(self._btn)
 
@@ -1160,6 +1941,55 @@ class LiveApiFloatButton(QWidget):
         new_state = not self._active
         self.set_active(new_state)
         self._toggle_callback(new_state)
+
+    # ── 右键：麦克风选择菜单 ──────────────────────────────────────────
+    def _show_mic_menu(self, global_pos):
+        try:
+            import pyaudio
+            import speech_recognition as speech_rec
+            from asr.manager import ASRManager
+        except ImportError:
+            return
+
+        menu = QMenu(self)
+        menu.setTitle("麦克风选择")
+
+        try:
+            pa = pyaudio.PyAudio()
+            names = speech_rec.Microphone.list_microphone_names()
+            current_idx = ASRManager.MICROPHONE_DEVICE_INDEX
+            added = 0
+            for i in range(pa.get_device_count()):
+                info = pa.get_device_info_by_index(i)
+                if int(info.get("maxInputChannels", 0)) <= 0:
+                    continue
+                name = names[i] if i < len(names) else info.get("name", f"Device {i}")
+                action = QAction(f"[{i}]  {name}", self)
+                action.setCheckable(True)
+                action.setChecked(i == current_idx)
+                action.triggered.connect(lambda _checked, idx=i: self._select_mic(idx))
+                menu.addAction(action)
+                added += 1
+            pa.terminate()
+        except Exception as e:
+            menu.addAction(QAction(f"枚举失败: {e}", self))
+
+        if menu.actions():
+            menu.exec_(global_pos)
+
+    def _select_mic(self, index: int):
+        from asr.manager import ASRManager
+        main_mod = get_main_module()
+        asr_mgr = getattr(main_mod, 'asr_manager', None)
+        if asr_mgr is not None:
+            try:
+                asr_mgr.set_microphone_index(index)
+                print(f"[LiveFloatBtn] 麦克风已切换至设备[{index}]")
+            except Exception as e:
+                print(f"[LiveFloatBtn] 切换麦克风失败: {e}")
+        else:
+            ASRManager.MICROPHONE_DEVICE_INDEX = index
+            print(f"[LiveFloatBtn] 已设置麦克风索引 → {index}（asr_manager 未就绪）")
 
     # ── 拖动支持 ─────────────────────────────────────────────────────
     def mousePressEvent(self, event):
@@ -1309,6 +2139,11 @@ class EmotionPresetsInterface(QWidget):
         # field → (QSlider, QLabel_value)
         self._sliders: dict[str, tuple] = {}
         self._auto_return_chk: QCheckBox | None = None
+        self._clip_interval_spin: QSpinBox | None = None
+        self._clip_loop_mode_combo: ComboBox | None = None
+        self._clip_preview_spin: QDoubleSpinBox | None = None
+        self._lock_live2d_chk: QCheckBox | None = None
+        self._rebind_btn = None
         self._init_ui()
         self._load_presets()
 
@@ -1332,6 +2167,15 @@ class EmotionPresetsInterface(QWidget):
         if self._preset_list.count():
             self._preset_list.setCurrentRow(0)
             self._on_preset_selected(self._preset_list.item(0))
+
+    def refresh_presets(self):
+        """手动刷新预设列表，并同步表达控制器配置。"""
+        self._load_presets()
+        try:
+            from vts.expression_controller import get_controller
+            get_controller().load_registry(self._preset_path())
+        except Exception:
+            pass
 
     def _save_and_reload(self):
         import json
@@ -1409,12 +2253,29 @@ class EmotionPresetsInterface(QWidget):
         title_row = QHBoxLayout()
         self._detail_title = SubtitleLabel("Select a preset", right)
         setFont(self._detail_title, 18)
+        self._lock_live2d_chk = QCheckBox("锁定Live2D", right)
+        self._lock_live2d_chk.setStyleSheet("QCheckBox { font-size:12px; color:#666; }")
+        self._lock_live2d_chk.setToolTip(
+            "勾选：Sprite 跟随 Live2D 移动/缩放\n"
+            "取消勾选后拖拽到合适位置，再勾选即可重新绑定"
+        )
+        self._lock_live2d_chk.stateChanged.connect(self._on_lock_live2d_changed)
+        self._rebind_btn = PushButton(FIF.SYNC, "重新绑定", right)
+        self._rebind_btn.setFixedSize(88, 32)
+        self._rebind_btn.setEnabled(False)
+        self._rebind_btn.setToolTip(
+            "【旧有表情】在当前位置重新捕获绑定点（等同于解锁后再锁定）\n"
+            "【锚点模式】将 X/Y 微调偏移归零，回到自动对齐位置"
+        )
+        self._rebind_btn.clicked.connect(self._on_rebind)
         self._test_btn = PushButton(FIF.PLAY, "Test", right)
         self._test_btn.setFixedSize(80, 32)
         self._test_btn.setEnabled(False)
         self._test_btn.clicked.connect(self._on_test)
         title_row.addWidget(self._detail_title)
         title_row.addStretch(1)
+        title_row.addWidget(self._lock_live2d_chk)
+        title_row.addWidget(self._rebind_btn)
         title_row.addWidget(self._test_btn)
         right_lay.addLayout(title_row)
 
@@ -1497,6 +2358,51 @@ class EmotionPresetsInterface(QWidget):
         chk_block.addLayout(chk_row)
         form_lay.addLayout(chk_block)
 
+        # Sprite clip config（in/loop/out）
+        clip_block = QVBoxLayout()
+        clip_block.setSpacing(8)
+        clip_header = QLabel("Sprite Clip (in / loop / out)", form)
+        clip_header.setStyleSheet("font-size:13px; color:#444; font-weight:500;")
+        clip_block.addWidget(clip_header)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(8)
+        row1.addWidget(QLabel("Frame Interval (ms)", form))
+        self._clip_interval_spin = QSpinBox(form)
+        self._clip_interval_spin.setRange(20, 200)
+        self._clip_interval_spin.setSingleStep(5)
+        self._clip_interval_spin.setValue(50)
+        self._clip_interval_spin.valueChanged.connect(self._on_clip_cfg_changed)
+        row1.addWidget(self._clip_interval_spin)
+        row1.addStretch(1)
+        clip_block.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+        row2.addWidget(QLabel("Loop Mode", form))
+        self._clip_loop_mode_combo = ComboBox(form)
+        self._clip_loop_mode_combo.addItems(["loop_until_speaking_end", "once_then_hold"])
+        self._clip_loop_mode_combo.setFixedWidth(220)
+        self._clip_loop_mode_combo.currentTextChanged.connect(self._on_clip_cfg_changed)
+        row2.addWidget(self._clip_loop_mode_combo)
+        row2.addStretch(1)
+        clip_block.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        row3.setSpacing(8)
+        row3.addWidget(QLabel("Test Preview (s)", form))
+        self._clip_preview_spin = QDoubleSpinBox(form)
+        self._clip_preview_spin.setRange(0.2, 12.0)
+        self._clip_preview_spin.setSingleStep(0.1)
+        self._clip_preview_spin.setDecimals(1)
+        self._clip_preview_spin.setValue(1.2)
+        self._clip_preview_spin.valueChanged.connect(self._on_clip_cfg_changed)
+        row3.addWidget(self._clip_preview_spin)
+        row3.addStretch(1)
+        clip_block.addLayout(row3)
+
+        form_lay.addLayout(clip_block)
+
         right_lay.addWidget(form)
         right_lay.addStretch(1)
 
@@ -1510,12 +2416,15 @@ class EmotionPresetsInterface(QWidget):
     # Callbacks
     # ------------------------------------------------------------------
     def _on_preset_selected(self, item: QListWidgetItem):
+        prev_name = self._current_preset
         name = item.text()
         self._current_preset = name
         cfg = self._data.get(name, {})
 
         self._detail_title.setText(f"Preset: {name}")
         self._test_btn.setEnabled(True)
+        if self._rebind_btn is not None:
+            self._rebind_btn.setEnabled(True)
 
         for field, label, fmin, fmax, step in self._FIELDS:
             slider, val_lbl = self._sliders[field]
@@ -1529,7 +2438,90 @@ class EmotionPresetsInterface(QWidget):
         self._auto_return_chk.blockSignals(True)
         self._auto_return_chk.setChecked(bool(cfg.get("auto_return_to_idle", False)))
         self._auto_return_chk.blockSignals(False)
+
+        clip_cfg = cfg.get("sprite_clip", {}) if isinstance(cfg, dict) else {}
+        if self._clip_interval_spin is not None:
+            self._clip_interval_spin.blockSignals(True)
+            self._clip_interval_spin.setValue(int(clip_cfg.get("frameIntervalMs", 50)))
+            self._clip_interval_spin.blockSignals(False)
+        if self._clip_loop_mode_combo is not None:
+            loop_mode = str(clip_cfg.get("loopMode", "loop_until_speaking_end"))
+            idx = self._clip_loop_mode_combo.findText(loop_mode)
+            if idx < 0:
+                idx = 0
+            self._clip_loop_mode_combo.blockSignals(True)
+            self._clip_loop_mode_combo.setCurrentIndex(idx)
+            self._clip_loop_mode_combo.blockSignals(False)
+        if self._clip_preview_spin is not None:
+            self._clip_preview_spin.blockSignals(True)
+            self._clip_preview_spin.setValue(float(clip_cfg.get("testPreviewSec", 1.2)))
+            self._clip_preview_spin.blockSignals(False)
+
         self._refresh_delay_enabled()
+        # 通知主界面切换到该表情的对齐配置（位置/缩放/锁定状态独立）
+        try:
+            main_win = self.window()
+            ci = getattr(main_win, "chatInterface", None) if main_win else None
+            if ci is not None and prev_name and hasattr(ci, "persist_expr_profile_from_renderer"):
+                ci.persist_expr_profile_from_renderer(prev_name)
+            if ci is not None and hasattr(ci, "on_emotion_preset_selected"):
+                ci.on_emotion_preset_selected(name)
+            if ci is not None and self._lock_live2d_chk is not None and hasattr(ci, "get_expr_lock_state_for_emotion"):
+                self._lock_live2d_chk.blockSignals(True)
+                self._lock_live2d_chk.setChecked(bool(ci.get_expr_lock_state_for_emotion(name)))
+                self._lock_live2d_chk.blockSignals(False)
+        except Exception:
+            pass
+
+    def _on_lock_live2d_changed(self, state: int):
+        try:
+            main_win = self.window()
+            ci = getattr(main_win, "chatInterface", None) if main_win else None
+            if ci is not None and hasattr(ci, "set_expr_lock_state_for_current_emotion"):
+                ci.set_expr_lock_state_for_current_emotion(state == Qt.Checked)
+        except Exception:
+            pass
+
+    def _on_rebind(self):
+        """重新绑定当前表情：
+        - 锚点感知模式：X/Y 微调归零，回到自动对齐位置
+        - 旧有表情：在当前位置重新捕获 delta（解锁 → 立即重锁）
+        """
+        try:
+            main_win = self.window()
+            ci = getattr(main_win, "chatInterface", None) if main_win else None
+            if ci is None:
+                return
+            emotion = self._current_preset
+            if not emotion:
+                return
+
+            if hasattr(ci, "_is_current_emotion_anchor_mode") and ci._is_current_emotion_anchor_mode():
+                # 锚点模式：归零微调偏移
+                ci._expr_x.blockSignals(True)
+                ci._expr_y.blockSignals(True)
+                ci._expr_x.setValue(0.0)
+                ci._expr_y.setValue(0.0)
+                ci._expr_x.blockSignals(False)
+                ci._expr_y.blockSignals(False)
+                ci._on_expr_transform_changed()
+            else:
+                # 旧有表情：解锁 → 立即重锁，重新捕获当前相对位置为 delta
+                if hasattr(ci, "_render_engine") and ci._render_engine is not None:
+                    ci._render_engine.set_sprite_align_lock_to_live2d(False, emotion=emotion)
+                    ci._render_engine.set_sprite_align_lock_to_live2d(True, emotion=emotion)
+                # 确保 lock checkbox 保持勾选
+                if self._lock_live2d_chk is not None:
+                    self._lock_live2d_chk.blockSignals(True)
+                    self._lock_live2d_chk.setChecked(True)
+                    self._lock_live2d_chk.blockSignals(False)
+                if hasattr(ci, "set_expr_lock_state_for_current_emotion"):
+                    ci.set_expr_lock_state_for_current_emotion(True)
+                # 重锁后立即持久化（从 JS 读取真实 offset，不依赖可能是旧值的滑条）
+                if hasattr(ci, "persist_expr_profile_from_renderer"):
+                    ci.persist_expr_profile_from_renderer(emotion)
+        except Exception:
+            pass
 
     def _refresh_delay_enabled(self):
         enabled = self._auto_return_chk.isChecked() if self._auto_return_chk else False
@@ -1563,12 +2555,50 @@ class EmotionPresetsInterface(QWidget):
             self._save_and_reload()
         self._refresh_delay_enabled()
 
+    def _on_clip_cfg_changed(self, *_args):
+        if not self._current_preset or self._current_preset not in self._data:
+            return
+        cfg = self._data[self._current_preset]
+        clip_cfg = cfg.get("sprite_clip")
+        if not isinstance(clip_cfg, dict):
+            clip_cfg = {}
+            cfg["sprite_clip"] = clip_cfg
+        if self._clip_interval_spin is not None:
+            clip_cfg["frameIntervalMs"] = int(self._clip_interval_spin.value())
+        if self._clip_loop_mode_combo is not None:
+            clip_cfg["loopMode"] = self._clip_loop_mode_combo.currentText()
+        if self._clip_preview_spin is not None:
+            clip_cfg["testPreviewSec"] = float(self._clip_preview_spin.value())
+        self._save_and_reload()
+
     def _on_test(self):
         if not self._current_preset:
             return
         try:
             from vts.expression_controller import get_controller
             get_controller().transition_to(self._current_preset)
+            # 兼容 clip-only 情绪（如 shy 的 in/loop/out）：
+            # transition_to 只切情绪，不会自动触发 speaking，
+            # 因此这里补一个短 speaking 脉冲用于预览说话动画。
+            main_win = self.window()
+            ci = getattr(main_win, "chatInterface", None) if main_win else None
+            engine = getattr(ci, "_render_engine", None) if ci else None
+            if engine is not None:
+                try:
+                    engine.set_emotion(self._current_preset)
+                    preview_ms = 1200
+                    cfg = self._data.get(self._current_preset, {}) if isinstance(self._data, dict) else {}
+                    clip_cfg = cfg.get("sprite_clip", {}) if isinstance(cfg, dict) else {}
+                    try:
+                        preview_ms = int(float(clip_cfg.get("testPreviewSec", 1.2)) * 1000)
+                    except Exception:
+                        preview_ms = 1200
+                    # 先 False 重置状态（防止上次 speaking=True 未结束导致 startClipSpeaking 不触发）
+                    engine.set_speaking(False)
+                    engine.set_speaking(True)
+                    QTimer.singleShot(max(200, preview_ms), lambda e=engine: e.set_speaking(False))
+                except Exception:
+                    pass
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning(f"[EmotionGUI] test failed: {e}")
@@ -1594,6 +2624,9 @@ class SubtitleWindow(FluentWindow):
         self.settingInterface = SettingInterface(self)
         self.openclawInterface = OpenClawInterface(self)
         self.emotionPresetsInterface = EmotionPresetsInterface(self)
+        self._emotion_drawer = None
+        self._emotion_drawer_open = False
+        self._emotion_drawer_anim = None
         # characterInterface 已合并到 chatInterface，此处保留别名供外部访问 engine()
         self.characterInterface = self.chatInterface
 
@@ -1611,7 +2644,6 @@ class SubtitleWindow(FluentWindow):
     def initNavigation(self):
         self.addSubInterface(self.chatInterface, FIF.CHAT, 'Chat')
         self.addSubInterface(self.openclawInterface, FIF.COMMAND_PROMPT, 'OpenClaw')
-        self.addSubInterface(self.emotionPresetsInterface, FIF.PALETTE, '表情预设')
         self.addSubInterface(self.settingInterface, FIF.SETTING, 'Settings', NavigationItemPosition.BOTTOM)
         # 等 UI 完全就绪后再自动恢复会话（避免初始化顺序问题）
         QTimer.singleShot(300, self._auto_restore_session)
@@ -1634,6 +2666,105 @@ class SubtitleWindow(FluentWindow):
                     break
         except Exception:
             pass
+
+    def _force_navbar_repaint_chain(self):
+        """按加载时序做多次刷新，降低首次 WebEngine 初始化后导航栏发黑概率。"""
+        delays = (0, 60, 140, 260, 420)
+        for d in delays:
+            QTimer.singleShot(d, self._force_navbar_repaint)
+
+    # ── Emotion Drawer（右侧抽屉）────────────────────────────────────────────
+    def _ensure_emotion_drawer(self):
+        if self._emotion_drawer is not None:
+            return
+        drawer = QFrame(self)
+        drawer.setObjectName("emotionDrawer")
+        drawer.setFixedWidth(560)
+        drawer.setStyleSheet(
+            "QFrame#emotionDrawer { background: #FFFFFF; border-left: 1px solid #E0E0E0; }"
+        )
+        lay = QVBoxLayout(drawer)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        header = QFrame(drawer)
+        header.setFixedHeight(44)
+        header.setStyleSheet("QFrame { background:#FAFAFA; border-bottom:1px solid #ECECEC; }")
+        h = QHBoxLayout(header)
+        h.setContentsMargins(12, 0, 8, 0)
+        h.setSpacing(8)
+        title = QLabel("表情预设", header)
+        title.setStyleSheet("font-size:13px; font-weight:600; color:#333;")
+        refresh_btn = PushButton("刷新", header)
+        refresh_btn.setFixedHeight(28)
+        refresh_btn.clicked.connect(self.emotionPresetsInterface.refresh_presets)
+        close_btn = TransparentToolButton(FIF.CLOSE, header)
+        close_btn.setToolTip("关闭表情预设")
+        close_btn.clicked.connect(lambda: self.toggle_emotion_drawer(False))
+        h.addWidget(title)
+        h.addStretch(1)
+        h.addWidget(refresh_btn)
+        h.addWidget(close_btn)
+        lay.addWidget(header)
+
+        self.emotionPresetsInterface.setParent(drawer)
+        lay.addWidget(self.emotionPresetsInterface, 1)
+
+        drawer.hide()
+        self._emotion_drawer = drawer
+        self._layout_emotion_drawer()
+
+    def _layout_emotion_drawer(self):
+        if self._emotion_drawer is None:
+            return
+        w = self._emotion_drawer.width()
+        h = self.height()
+        x = self.width() - w if self._emotion_drawer_open else self.width()
+        self._emotion_drawer.setGeometry(x, 0, w, h)
+
+    def toggle_emotion_drawer(self, open_state=None):
+        self._ensure_emotion_drawer()
+        if open_state is None:
+            target_open = not self._emotion_drawer_open
+        else:
+            target_open = bool(open_state)
+        if self._emotion_drawer_open == target_open:
+            return
+
+        # 打开抽屉前重载一次预设，确保外部修改（如新增 working）能即时显示。
+        if target_open:
+            try:
+                self.emotionPresetsInterface._load_presets()
+            except Exception:
+                pass
+
+        drawer = self._emotion_drawer
+        w = drawer.width()
+        h = self.height()
+        start_x = drawer.x()
+        end_x = self.width() - w if target_open else self.width()
+        drawer.setGeometry(start_x, 0, w, h)
+        drawer.show()
+        drawer.raise_()
+
+        anim = QPropertyAnimation(drawer, b"geometry", self)
+        anim.setDuration(220)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.setStartValue(QRect(start_x, 0, w, h))
+        anim.setEndValue(QRect(end_x, 0, w, h))
+
+        def _on_done():
+            self._emotion_drawer_open = target_open
+            if not target_open:
+                drawer.hide()
+
+        anim.finished.connect(_on_done)
+        self._emotion_drawer_anim = anim
+        anim.start()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout_emotion_drawer()
 
     def _sync_live_btn_initial(self):
         """启动后同步一次 Live API 初始状态到悬浮按钮。"""

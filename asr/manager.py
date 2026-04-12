@@ -10,12 +10,18 @@ import traceback
 import pyaudio
 import speech_recognition as speech_rec
 
+from config.settings import (
+    MICROPHONE_DEVICE_INDEX as _CFG_MIC_INDEX,
+    MICROPHONE_PREFERRED_NAME as _CFG_MIC_PREFERRED,
+)
+
 logger = logging.getLogger(__name__)
 
 
 class ASRManager:
     # 可在此处强制指定麦克风设备索引（None = 自动选择 RMS 最高设备）
-    MICROPHONE_DEVICE_INDEX = None
+    # 优先读取 settings / .env 中的 MICROPHONE_DEVICE_INDEX（-1 表示不强制）
+    MICROPHONE_DEVICE_INDEX = _CFG_MIC_INDEX if _CFG_MIC_INDEX >= 0 else None
 
     def __init__(self):
         self.logger = logging.getLogger("asr_manager")
@@ -75,10 +81,20 @@ class ASRManager:
                         continue
 
                 # 虚拟/映射设备 RMS 强制降权（即使能打开也不优先）
+                # 用 min(rms, -1) 而非 min(rms, 0)，确保真实麦克风静音时(RMS=0)也能胜出
                 is_virtual = any(v.lower() in dev_name.lower() for v in _VIRTUAL_NAMES)
-                effective_rms = rms if not is_virtual else min(rms, 0)
+                effective_rms = rms if not is_virtual else min(rms, -1)
 
-                print(f"[ASR]   [{i}] {dev_name}  RMS={rms}{'(virtual)' if is_virtual else ''}")
+                # 偏好设备提权：名称包含 MICROPHONE_PREFERRED_NAME 时加大权重
+                is_preferred = (
+                    bool(_CFG_MIC_PREFERRED)
+                    and _CFG_MIC_PREFERRED.lower() in dev_name.lower()
+                )
+                if is_preferred and not is_virtual:
+                    effective_rms += 10000
+
+                tag = "(virtual)" if is_virtual else ("(preferred)" if is_preferred else "")
+                print(f"[ASR]   [{i}] {dev_name}  RMS={rms}{tag}")
                 if effective_rms > best_rms:
                     best_rms = effective_rms
                     best_index = i

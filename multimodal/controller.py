@@ -18,6 +18,7 @@ import os
 import time
 
 import live.sidecar as _live_mod
+from config.settings import VAD_HANGOVER_MS, VAD_ENERGY_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +76,8 @@ async def _start_multimodal_if_enabled():
                 "scene_hist_threshold": 0.95,
                 "attach_video_clip": False,
                 "input_device_index": mic_idx,
-                "vad_energy_threshold": 600,
-                "vad_hangover_ms": 200,
+                "vad_energy_threshold": VAD_ENERGY_THRESHOLD,
+                "vad_hangover_ms": VAD_HANGOVER_MS,
             }
         else:
             visual_config = {"input_source": MULTIMODAL_INPUT_SOURCE}
