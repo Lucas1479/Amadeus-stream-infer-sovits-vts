@@ -109,3 +109,6 @@ render/assets/Anime/
 render/assets/shy_seedance_manual_v7/
 render/assets/shy_*/
 render/assets/images/*/
+
+# 口型调试用参考图（本地生成）
+tools/debug_mouth/*.png
