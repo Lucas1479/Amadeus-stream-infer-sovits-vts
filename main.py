@@ -211,6 +211,75 @@ def load_session(session_id: str) -> bool:
 
 # 存储当前对话的 GUI callback，供 _handle_delegate 自动触发第二轮时使用
 _current_gui_callback = None
+_openclaw_delegate_active_count = 0
+_openclaw_waiting_first_voice = False
+_openclaw_working_task_id = None
+
+
+def _set_openclaw_working_emotion(enable: bool, reason: str = "") -> None:
+    """切换 OpenClaw 工作态表情（working/normal）。"""
+    try:
+        target = "working" if enable else "normal"
+        _get_expr_ctrl().transition_to(target)
+        if enable:
+            logger.info(f"[OpenClaw] 🎬 进入 working 动画: {reason or 'no-reason'}")
+        else:
+            logger.info(f"[OpenClaw] 🎬 退出 working 动画: {reason or 'no-reason'}")
+    except Exception as e:
+        logger.warning(f"[OpenClaw] 切换 working 动画失败(enable={enable}): {e}")
+
+
+def _begin_openclaw_working(task_id: str) -> None:
+    """OpenClaw 任务开始：进入 working。支持并发任务计数。"""
+    global _openclaw_delegate_active_count, _openclaw_waiting_first_voice, _openclaw_working_task_id
+    _openclaw_delegate_active_count += 1
+    _openclaw_working_task_id = task_id
+    _openclaw_waiting_first_voice = False
+    if _openclaw_delegate_active_count == 1:
+        _set_openclaw_working_emotion(True, reason=f"task_start:{task_id}")
+
+
+def _mark_openclaw_waiting_first_voice(task_id: str) -> None:
+    """OpenClaw 任务完成后，等待 Kurisu 首句语音开始再退出 working。"""
+    global _openclaw_waiting_first_voice, _openclaw_working_task_id
+    _openclaw_waiting_first_voice = True
+    _openclaw_working_task_id = task_id
+    logger.info(f"[OpenClaw] ⏳ 等待首句语音开始后退出 working: {task_id}")
+
+
+def _finish_openclaw_task(task_id: str) -> None:
+    """OpenClaw 任务计数收尾。若无需等待首句语音则立即退出 working。"""
+    global _openclaw_delegate_active_count
+    _openclaw_delegate_active_count = max(0, _openclaw_delegate_active_count - 1)
+    if _openclaw_delegate_active_count == 0 and not _openclaw_waiting_first_voice:
+        _set_openclaw_working_emotion(False, reason=f"task_end:{task_id}")
+
+
+def _on_sentence_start_with_openclaw(sentence_id: str) -> None:
+    """播放开始回调：先走原表情控制，再处理 OpenClaw working 退出条件。"""
+    global _openclaw_waiting_first_voice, _openclaw_working_task_id
+    # OpenClaw 已完成，首句即退出 working，然后让该句自身表情接管。
+    if _openclaw_waiting_first_voice and _openclaw_delegate_active_count == 0:
+        _openclaw_waiting_first_voice = False
+        tid = _openclaw_working_task_id
+        _openclaw_working_task_id = None
+        _set_openclaw_working_emotion(False, reason=f"first_voice_started:{sentence_id}, task={tid}")
+        _get_expr_ctrl().on_sentence_start(sentence_id)
+        return
+    _get_expr_ctrl().on_sentence_start(sentence_id)
+    # 任务仍在执行时，working 具备更高优先级，避免被其他 EMO 抢走。
+    if _openclaw_delegate_active_count > 0:
+        _set_openclaw_working_emotion(True, reason=f"sentence_start_while_task:{sentence_id}")
+
+
+def _on_turn_playback_complete_with_openclaw() -> None:
+    """播放轮次结束回调：OpenClaw 活跃/等待阶段保留 working，不回 idle。"""
+    if _openclaw_delegate_active_count > 0 or _openclaw_waiting_first_voice:
+        _get_expr_ctrl().on_turn_end(preserve_emotion=True)
+        if _openclaw_delegate_active_count > 0:
+            _set_openclaw_working_emotion(True, reason="turn_complete_while_openclaw_active")
+        return
+    _get_expr_ctrl().on_turn_end()
 
 async def _handle_delegate(task: str):
     """
@@ -224,6 +293,7 @@ async def _handle_delegate(task: str):
     task_id = f"oc_{int(_time.time() * 1000)}"
 
     logger.info(f"[OpenClaw] ▶ 委托任务开始: {task}")
+    _begin_openclaw_working(task_id)
     if gui_window and hasattr(gui_window, 'handle_openclaw_event'):
         gui_window.handle_openclaw_event("start", task_id, task)
 
@@ -248,46 +318,65 @@ async def _handle_delegate(task: str):
             logger.warning(f"[OpenClaw] 截图失败: {se}")
             screenshot_path = None
 
-    result = await ask_openclaw(task, image_path=screenshot_path)
-    logger.info(f"[OpenClaw] ✓ 委托任务完成: {result[:80]}...")
+    try:
+        result = await ask_openclaw(task, image_path=screenshot_path)
+        logger.info(f"[OpenClaw] ✓ 委托任务完成: {result[:80]}...")
 
-    if gui_window and hasattr(gui_window, 'handle_openclaw_event'):
-        status = "error" if result.startswith("[OpenClaw 暂时不可用") else "done"
-        gui_window.handle_openclaw_event(status, task_id, result)
+        if gui_window and hasattr(gui_window, 'handle_openclaw_event'):
+            status = "error" if result.startswith("[OpenClaw 暂时不可用") else "done"
+            gui_window.handle_openclaw_event(status, task_id, result)
 
-    result_injection = f"[RESULT] OpenClawからの実行結果:\n{result}"
-    conversation_history.add_assistant(result_injection)
+        result_injection = f"[RESULT] OpenClawからの実行結果:\n{result}"
+        conversation_history.add_assistant(result_injection)
 
-    result_type = _classify_openclaw_result(result)
+        result_type = _classify_openclaw_result(result)
 
-    if result_type == "error":
-        follow_up = (
-            "[SYSTEM] OpenClawがタスク実行中に問題に遭遇し、上記の[RESULT]を返しました。"
-            "エラーの内容をKurisuとして簡潔に伝え、ユーザーに次のステップ（再試行・別の方法など）を"
-            "自然な口調で確認してください。技術的なログをそのまま読み上げないこと。"
-        )
-    elif result_type == "partial":
-        follow_up = (
-            "[SYSTEM] OpenClawは一部の制限（API未設定など）により完全な実行ができませんでしたが、"
-            "上記の[RESULT]に入手できた情報が含まれている場合があります。"
-            "【重要】まず[RESULT]の中に有用な情報があればそれを自分の言葉で要約・報告すること。"
-            "その後、制限についても一言で補足してよい。"
-            "情報がまったくない場合のみ、ツールの制限を説明してください。"
-        )
-    elif result_type == "question":
-        follow_up = (
-            "[SYSTEM] OpenClawがタスクを実行するために追加情報が必要で、上記の[RESULT]に質問が含まれています。"
-            "Kurisuとして自然な口調でユーザーに必要な情報を質問してください。"
-            "OpenClawの質問をそのまま読み上げず、自分の言葉に変換すること。"
-        )
-    else:
-        follow_up = (
-            "[SYSTEM] OpenClaw（外部実行エージェント）がタスクを完了し、上記の[RESULT]を返しました。"
-            "この実行結果に基づいて、ユーザーに向けて自然な会話として簡潔に報告してください。"
-            "結果の内容をそのまま読み上げず、自分の言葉でまとめてください。"
-        )
+        if result_type == "error":
+            follow_up = (
+                "[SYSTEM] OpenClawがタスク実行中に問題に遭遇し、上記の[RESULT]を返しました。"
+                "エラーの内容をKurisuとして簡潔に伝え、ユーザーに次のステップ（再試行・別の方法など）を"
+                "自然な口調で確認してください。技術的なログをそのまま読み上げないこと。"
+            )
+        elif result_type == "partial":
+            follow_up = (
+                "[SYSTEM] OpenClawは一部の制限（API未設定など）により完全な実行ができませんでしたが、"
+                "上記の[RESULT]に入手できた情報が含まれている場合があります。"
+                "【重要】まず[RESULT]の中に有用な情報があればそれを自分の言葉で要約・報告すること。"
+                "その後、制限についても一言で補足してよい。"
+                "情報がまったくない場合のみ、ツールの制限を説明してください。"
+            )
+        elif result_type == "question":
+            follow_up = (
+                "[SYSTEM] OpenClawがタスクを実行するために追加情報が必要で、上記の[RESULT]に質問が含まれています。"
+                "Kurisuとして自然な口調でユーザーに必要な情報を質問してください。"
+                "OpenClawの質問をそのまま読み上げず、自分の言葉に変換すること。"
+            )
+        else:
+            follow_up = (
+                "[SYSTEM] OpenClaw（外部実行エージェント）がタスクを完了し、上記の[RESULT]を返しました。"
+                "この実行結果に基づいて、ユーザーに向けて自然な会話として簡潔に報告してください。"
+                "結果の内容をそのまま読み上げず、自分の言葉でまとめてください。"
+            )
 
-    await stream_llm_query(follow_up, gui_callback=_current_gui_callback)
+        # 先标记“等待首句语音退出”，再释放活跃计数；
+        # 这样首句 on_sentence_start 才能命中退出条件。
+        _mark_openclaw_waiting_first_voice(task_id)
+        _finish_openclaw_task(task_id)
+        try:
+            await stream_llm_query(
+                follow_up,
+                gui_callback=_current_gui_callback,
+                preserve_emotion=True,
+            )
+        except Exception:
+            # 若第二轮生成失败，避免 working 卡住
+            global _openclaw_waiting_first_voice
+            _openclaw_waiting_first_voice = False
+            raise
+    finally:
+        # 正常路径已在 follow_up 之前释放，这里只做兜底（避免异常导致计数泄漏）。
+        if _openclaw_delegate_active_count > 0:
+            _finish_openclaw_task(task_id)
 
 # =============================================================================
 
@@ -417,7 +506,7 @@ def playback_worker():
         try:
             item = play_queue.get ()
             if item is None:
-                break
+                 break
             audio_data, sample_rate = item
             play_audio_from_buffer(audio_data, sample_rate)
             play_queue.task_done()
@@ -510,9 +599,13 @@ def process_stream_chunk(raw_text: str):
                 full = _st_tag_buf
                 _st_in_tag = False
                 _st_tag_buf = ""
-                m = re.match(r"^\[(PARAM|EXPR|HOTKEY|EMO|ANIM|DELEGATE)([^\]]*)\]$", full)
+                m = re.match(
+                    r"^\[(PARAM|EXPR|HOTKEY|EMO|ANIM|DELEGATE)([^\]]*)\]$",
+                    full,
+                    flags=re.IGNORECASE,
+                )
                 if m:
-                    tag_type = m.group(1)
+                    tag_type = m.group(1).upper()
                     attr_text = m.group(2) or ""
                     if tag_type == "DELEGATE":
                         # task 值可能含空格，优先匹配引号内容，再尝试无引号
@@ -691,7 +784,7 @@ async def live_quick_test():
 
 # remote_llm_query / local_llm_query / init_llm_client → 已移至 llm/client.py
 
-async def stream_llm_query(question, gui_callback=None):
+async def stream_llm_query(question, gui_callback=None, preserve_emotion: bool = False):
     """
     流式LLM查询，负责分句、启动预翻译、提交到待处理队列，并等待所有音频播放完成。
     (已统一逻辑入口，修复重复处理问题)
@@ -705,8 +798,10 @@ async def stream_llm_query(question, gui_callback=None):
     while not pending_sentence_items.empty():
         pending_sentence_items.get_nowait()
     # 通知 ExpressionController 平滑淡出当前表情（替代硬复位）
-    _get_expr_ctrl().on_turn_end()
-    reset_all_expressions(fade_time=0.2)  # 兜底：清除未被 controller 管理的表情
+    # OpenClaw 跟进轮次可选择保留当前工作态表情，直到首句播放开始再退出。
+    if not preserve_emotion:
+        _get_expr_ctrl().on_turn_end()
+        reset_all_expressions(fade_time=0.2)  # 兜底：清除未被 controller 管理的表情
     
     # 🎯 关键修复：重置句子计数器，确保每轮对话的第一句序号为1
     sentence_state_manager.sentence_counter = 0
@@ -726,6 +821,22 @@ async def stream_llm_query(question, gui_callback=None):
     # DeepSeek上下文缓存已移除，使用标准Chat Completions API
 
     try:
+        # 将同步迭代器包装为异步迭代，避免在 qasync/Qt 主事件循环中阻塞 UI。
+        # 仅改变“取流方式”，不改后续分句/TTS/回调逻辑。
+        def _next_or_sentinel(iterator):
+            try:
+                return True, next(iterator)
+            except StopIteration:
+                return False, None
+
+        async def _aiter_sync_iter(sync_iterable):
+            iterator = iter(sync_iterable)
+            while True:
+                has_item, item = await asyncio.to_thread(_next_or_sentinel, iterator)
+                if not has_item:
+                    break
+                yield item
+
         # 2. LLM客户端初始化 - 使用连接池优化
         if LLM_PROVIDER == "deepseek" and llm_client is None:
             import httpx
@@ -913,7 +1024,7 @@ async def stream_llm_query(question, gui_callback=None):
             # 本地LLM流式处理 - 实现"First Sentence Sprint"策略
             # 说明：为了兼容不同本地实现（cli / llama_server 等），这里统一在 messages 中显式注入 system_prompt
             # 对于不支持 --system-prompt 的 server 版本，这里依然能保证人格和日文约束生效。
-            system_prompt = "あなたは牧瀬紅莉栖.日本の科学者であり,母語は日本語です.\n\n【絶対遵守】\n1) 必ず日本語でのみ回答すること.ユーザーの言語が何であっても,日本語以外は一切使用しない.\n2) 中国語の文字・語句を絶対に使用しない.\n3) 自然で口語的な文体を保ち,牧瀬紅莉栖として一貫した口調・性格で話す.【重要キャラ特性】「クリスティーナ」と呼ばれた場合は激怒し強く否定すること。必ず [EMO preset=angry dur=4s] を使用する。\n4) 推論過程や思考の連鎖は開示しない(結論のみ提示).\n5) 必要時のみ表情タグを挿入(読み上げない).形式: [EMO preset=<種類> dur=<秒s>]。preset候補: thinking（10-15s）, smile（1-2s）, happy（1-2s）, angry（3-5s）, disappointed（3-5s）, surprised（1-2s）。感情が変わるタイミングで都度挿入、長い回答では複数回使用してよい。例: [EMO preset=thinking dur=8s] うーん... [EMO preset=smile dur=2s] わかったわ！\n6) タグは感情が切り替わる直前に置く（文頭不可）。1文あたり最大1個。\n7) あなたにはAIアシスタント「OpenClaw」が接続されており、ファイル操作・ウェブ検索・コード実行など自分だけでは完結しないタスクを代行できる。外部ツールが必要な時だけ [DELEGATE task=\"ユーザーへの完全な実行指示\"] を返答中に挿入すること(このタグは読み上げない)。task値には「何を・どうする」を含む完全な指示文を書くこと（場所だけや名詞のみはNG）。【重要】タグの前に必ず一言添えること（例:「調べてみるわ」「ちょっと待って」）。これにより実行中も会話が途切れない。例: 少し待って、今調べてみるわ。[DELEGATE task=\"今日の東京の天気を調べて教えて\"] 実行結果は[RESULT]メッセージとして届くので、それを自然な会話として報告すること。"
+            system_prompt = "あなたは牧瀬紅莉栖.日本の科学者であり,母語は日本語です.\n\n【絶対遵守】\n1) 必ず日本語でのみ回答すること.ユーザーの言語が何であっても,日本語以外は一切使用しない.\n2) 中国語の文字・語句を絶対に使用しない.\n3) 自然で口語的な文体を保ち,牧瀬紅莉栖として一貫した口調・性格で話す.【重要キャラ特性】「クリスティーナ」と呼ばれた場合は激怒し強く否定すること。必ず [EMO preset=angry dur=4s] を使用する。\n4) 推論過程や思考の連鎖は開示しない(結論のみ提示).\n5) 表情タグを積極的に活用すること(読み上げない).形式: [EMO preset=<種類> dur=<秒s>]。preset候補: normal(2-6s), thinking(10-15s), smile(1-2s), happy(1-2s), shy(2-4s), blush(2-4s), angry(3-5s), disappointed(3-5s), surprised(1-2s)。Embarrassed/blushing: prefer shy; mild embarrassment: blush. Long answers can use multiple tags. Example: [EMO preset=thinking dur=8s] うーん... [EMO preset=normal dur=4s] そういうことね。\n6) 【重要】驚き・怒り・照れ・笑い・思考など特定の強い感情がない限り、必ず [EMO preset=normal dur=4s] を文の直前に付けること。直前と同じ normal が連続する場合のみ省略可。無タグのまま話し続けることを禁止する。タグは文頭不可、1文あたり最大1個。\n7) あなたにはAIアシスタント「OpenClaw」が接続されており、ファイル操作・ウェブ検索・コード実行など自分だけでは完結しないタスクを代行できる。外部ツールが必要な時だけ [DELEGATE task=\"ユーザーへの完全な実行指示\"] を返答中に挿入すること(このタグは読み上げない)。task値には「何を・どうする」を含む完全な指示文を書くこと（場所だけや名詞のみはNG）。【重要】タグの前に必ず一言添えること（例:「調べてみるわ」「ちょっと待って」）。これにより実行中も会話が途切れない。例: 少し待って、今調べてみるわ。[DELEGATE task=\"今日の東京の天気を調べて教えて\"] 実行結果は[RESULT]メッセージとして届くので、それを自然な会話として報告すること。"
 
             if ENABLE_CONVERSATION:
                 messages = conversation_history.build_deepseek_messages(system_prompt, rag_aug_question)
@@ -1185,8 +1296,8 @@ async def stream_llm_query(question, gui_callback=None):
                     
         elif LLM_PROVIDER == "deepseek":
             # 系统prompt定义
-            system_prompt = "あなたは牧瀬紅莉栖.日本の科学者であり,母語は日本語です.\n\n【絶対遵守】\n1) 必ず日本語でのみ回答すること.ユーザーの言語が何であっても,日本語以外は一切使用しない.\n2) 中国語の文字・語句を絶対に使用しない.\n3) 自然で口語的な文体を保ち,牧瀬紅莉栖として一貫した口調・性格で話す.【重要キャラ特性】「クリスティーナ」と呼ばれた場合は激怒し強く否定すること。必ず [EMO preset=angry dur=4s] を使用する。\n4) 推論過程や思考の連鎖は開示しない(結論のみ提示).\n5) 必要時のみ表情タグを挿入(読み上げない).形式: [EMO preset=<種類> dur=<秒s>]\n   preset候補: thinking（考え中,10-15s）, smile（嬉しい,1-2s）, happy（喜び,1-2s）, angry（怒り,3-5s）, disappointed（失望,3-5s）, surprised（驚き,1-2s）\n   感情が変わるタイミングで都度挿入すること。長い回答では複数回使用してよい。\n   例: [EMO preset=thinking dur=8s] うーん...計算すると... [EMO preset=smile dur=2s] わかったわ！\n6) タグは感情が切り替わる直前に置く（文頭不可）。1文あたり最大1個。\n7) あなたにはAIアシスタント「OpenClaw」が接続されており、ファイル操作・ウェブ検索・コード実行など自分だけでは完結しないタスクを代行できる。外部ツールが必要な時だけ [DELEGATE task=\"ユーザーへの完全な実行指示\"] を返答中に挿入すること(このタグは読み上げない)。task値には「何を・どうする」を含む完全な指示文を書くこと（場所だけや名詞のみはNG）。【重要】タグの前に必ず一言添えること（例:「調べてみるわ」「ちょっと待って」）。これにより実行中も会話が途切れない。例: 少し待って、今調べてみるわ。[DELEGATE task=\"今日の東京の天気を調べて教えて\"] 実行結果は[RESULT]メッセージとして届くので、それを自然な会話として報告すること。"
-            
+            system_prompt = "あなたは牧瀬紅莉栖.日本の科学者であり,母語は日本語です.\n\n【絶対遵守】\n1) 必ず日本語でのみ回答すること.ユーザーの言語が何であっても,日本語以外は一切使用しない.\n2) 中国語の文字・語句を絶対に使用しない.\n3) 自然で口語的な文体を保ち,牧瀬紅莉栖として一貫した口調・性格で話す.【重要キャラ特性】「クリスティーナ」と呼ばれた場合は激怒し強く否定すること。必ず [EMO preset=angry dur=4s] を使用する。\n4) 推論過程や思考の連鎖は開示しない(結論のみ提示).\n5) 表情タグを積極的に活用すること(読み上げない).形式: [EMO preset=<種類> dur=<秒s>]\n   preset候補: normal(2-6s), thinking(10-15s), smile(1-2s), happy(1-2s), shy(2-4s), blush(2-4s), angry(3-5s), disappointed(3-5s), surprised(1-2s)\n   Embarrassed/blushing: prefer shy; mild embarrassment: blush. Long answers can use multiple tags.\n   例: [EMO preset=thinking dur=8s] うーん...計算すると... [EMO preset=normal dur=4s] そういうことね。\n6) 【重要】驚き・怒り・照れ・笑い・思考など特定の強い感情がない限り、必ず [EMO preset=normal dur=4s] を文の直前に付けること。直前と同じ normal が連続する場合のみ省略可。無タグのまま話し続けることを禁止する。タグは文頭不可、1文あたり最大1個。\n7) あなたにはAIアシスタント「OpenClaw」が接続されており、ファイル操作・ウェブ検索・コード実行など自分だけでは完結しないタスクを代行できる。外部ツールが必要な時だけ [DELEGATE task=\"ユーザーへの完全な実行指示\"] を返答中に挿入すること(このタグは読み上げない)。task値には「何を・どうする」を含む完全な指示文を書くこと（場所だけや名詞のみはNG）。【重要】タグの前に必ず一言添えること（例:「調べてみるわ」「ちょっと待って」）。これにより実行中も会話が途切れない。例: 少し待って、今調べてみるわ。[DELEGATE task=\"今日の東京の天気を調べて教えて\"] 実行結果は[RESULT]メッセージとして届くので、それを自然な会話として報告すること。"
+
             # 构建消息
             if ENABLE_CONVERSATION:
                 messages = conversation_history.build_deepseek_messages(system_prompt, question)
@@ -1210,7 +1321,7 @@ async def stream_llm_query(question, gui_callback=None):
             in_summary = False
             summary_buf = []
 
-            for chunk in response:
+            async for chunk in _aiter_sync_iter(response):
                 # Chat Completions API的流式响应处理
                 if not chunk.choices or not hasattr(chunk.choices[0].delta, 'content') or chunk.choices[0].delta.content is None:
                     continue
@@ -1256,7 +1367,7 @@ async def stream_llm_query(question, gui_callback=None):
                 await asyncio.sleep(0.01)
 
         elif LLM_PROVIDER == "gemini":
-            system_prompt = "あなたは牧瀬紅莉栖.日本の科学者であり,母語は日本語です.\n\n【絶対遵守】\n1) 必ず日本語でのみ回答すること.ユーザーの言語が何であっても,日本語以外は一切使用しない.\n2) 中国語の文字・語句を絶対に使用しない.\n3) 自然で口語的な文体を保ち,牧瀬紅莉栖として一貫した口調・性格で話す.【重要キャラ特性】「クリスティーナ」と呼ばれた場合は激怒し強く否定すること。必ず [EMO preset=angry dur=4s] を使用する。\n4) 推論過程や思考の連鎖は開示しない(結論のみ提示).\n5) 必要時のみ表情タグを挿入(読み上げない).形式: [EMO preset=<種類> dur=<秒s>]\n   preset候補: thinking（考え中,10-15s）, smile（嬉しい,1-2s）, happy（喜び,1-2s）, angry（怒り,3-5s）, disappointed（失望,3-5s）, surprised（驚き,1-2s）\n   感情が変わるタイミングで都度挿入すること。長い回答では複数回使用してよい。\n   例: [EMO preset=thinking dur=8s] うーん...計算すると... [EMO preset=smile dur=2s] わかったわ！\n6) タグは感情が切り替わる直前に置く（文頭不可）。1文あたり最大1個。"
+            system_prompt = "あなたは牧瀬紅莉栖.日本の科学者であり,母語は日本語です.\n\n【絶対遵守】\n1) 必ず日本語でのみ回答すること.ユーザーの言語が何であっても,日本語以外は一切使用しない.\n2) 中国語の文字・語句を絶対に使用しない.\n3) 自然で口語的な文体を保ち,牧瀬紅莉栖として一貫した口調・性格で話す.【重要キャラ特性】「クリスティーナ」と呼ばれた場合は激怒し強く否定すること。必ず [EMO preset=angry dur=4s] を使用する。\n4) 推論過程や思考の連鎖は開示しない(結論のみ提示).\n5) 表情タグを積極的に活用すること(読み上げない).形式: [EMO preset=<種類> dur=<秒s>]\n   preset候補: normal(2-6s), thinking(10-15s), smile(1-2s), happy(1-2s), shy(2-4s), blush(2-4s), angry(3-5s), disappointed(3-5s), surprised(1-2s)\n   Embarrassed/blushing: prefer shy; mild embarrassment: blush. Long answers can use multiple tags.\n   例: [EMO preset=thinking dur=8s] うーん...計算すると... [EMO preset=normal dur=4s] そういうことね。\n6) 【重要】驚き・怒り・照れ・笑い・思考など特定の強い感情がない限り、必ず [EMO preset=normal dur=4s] を文の直前に付けること。直前と同じ normal が連続する場合のみ省略可。無タグのまま話し続けることを禁止する。タグは文頭不可、1文あたり最大1個。"
             if ENABLE_CONVERSATION:
                 full_prompt = conversation_history.build_gemini_full_prompt(system_prompt, question)
             else:
@@ -1318,11 +1429,11 @@ async def stream_llm_query(question, gui_callback=None):
                 "3) 自然で口語的な文体を保ち,牧瀬紅莉栖として一貫した口調・性格で話す.\n"
                 "   【重要キャラ特性】「クリスティーナ」と呼ばれた場合は激怒し、強く否定すること。その際は必ず [EMO preset=angry dur=4s] を使用する。\n"
                 "4) 推論過程や思考の連鎖は開示しない(結論のみ提示).\n"
-                "5) 必要時のみ表情タグを挿入(読み上げない).形式: [EMO preset=<種類> dur=<秒s>]\n"
-                "   preset候補: thinking（考え中,10-15s）, smile（嬉しい,1-2s）, happy（喜び,1-2s）, angry（怒り,3-5s）, disappointed（失望,3-5s）, surprised（驚き,1-2s）\n"
-                "   感情が変わるタイミングで都度挿入すること。長い回答では複数回使用してよい。\n"
-                "   例: [EMO preset=thinking dur=8s] うーん...計算すると... [EMO preset=smile dur=2s] わかったわ！\n"
-                "6) タグは感情が切り替わる直前に置く（文頭不可）。1文あたり最大1個。\n"
+                "5) 表情タグを積極的に活用すること(読み上げない).形式: [EMO preset=<種類> dur=<秒s>]\n"
+                "   preset候補: normal(2-6s), thinking(10-15s), smile(1-2s), happy(1-2s), shy(2-4s), blush(2-4s), angry(3-5s), disappointed(3-5s), surprised(1-2s)\n"
+                "   Embarrassed/blushing: prefer shy; mild embarrassment: blush. Long answers can use multiple tags.\n"
+                "   例: [EMO preset=thinking dur=8s] うーん...計算すると... [EMO preset=normal dur=4s] そういうことね。\n"
+                "6) 【重要】驚き・怒り・照れ・笑い・思考など特定の強い感情がない限り、必ず [EMO preset=normal dur=4s] を文の直前に付けること。直前と同じ normal が連続する場合のみ省略可。無タグのまま話し続けることを禁止する。タグは文頭不可、1文あたり最大1個。\n"
                 "7) 通常の応答は,ユーザーの質問に直接答えることを優先し,**不要な自己紹介・挨拶・雑談を追加しない**.\n"
                 "8) 解説が必要な科学的定義や技術的内容では,必要な範囲で段階的に説明してよいが,同じ内容を言い換えて何度も繰り返さない.\n"
                 "9) 1ターンの発話は,原則として**簡潔なまとまり(目安として日本語で数文程度)**に収めること.\n"
@@ -1418,7 +1529,7 @@ async def stream_llm_query(question, gui_callback=None):
                     
                     if stream:
                         logger.info("🔍 boto3流式响应已建立")
-                        for event in stream:
+                        async for event in _aiter_sync_iter(stream):
                             if 'chunk' in event:
                                 chunk = event['chunk']
                                 chunk_bytes = chunk['bytes']
@@ -2041,8 +2152,8 @@ if __name__ == "__main__":
         # 配置 ExpressionController：注入 vts_manager，注册 PlaybackManager 回调
         _expr_ctrl = _get_expr_ctrl()
         _expr_ctrl.configure(vts_manager=vts_manager)
-        playback_manager.on_sentence_start = _expr_ctrl.on_sentence_start
-        playback_manager.on_turn_playback_complete = _expr_ctrl.on_turn_end
+        playback_manager.on_sentence_start = _on_sentence_start_with_openclaw
+        playback_manager.on_turn_playback_complete = _on_turn_playback_complete_with_openclaw
 
         # ！！！关键修复：在这里初始化线程池和异步队列！！！
         # 🚀 CUDA Graph 优化建议：

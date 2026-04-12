@@ -159,14 +159,17 @@ _SYSTEM_PROMPT_BASE = (
     "4) 推論過程や思考の連鎖は開示しない(結論のみ提示).\n"
     "5) 表情タグの活用ガイド（自然な感情表現のため、適切に使用）:\n"
     "   形式: [EMO preset=<種類> dur=<秒s>] / [EXPR name=<表情> weight=<0..1> dur=<秒s> fade=<秒> active=true|false]\n"
-    "   推奨: 瞬間=1-2s（smile/happy）、短期=3-5s（angry/sad）、持続=10-15s（thinking）\n"
-    "   例: [EMO preset=thinking dur=12s], [EMO preset=smile dur=2s]\n"
-    "6) 1文あたり0〜2個、文頭には置かず、該当箇所の直前にのみ控えめに配置する（必須ではない）。"
+    "   推奨: 通常=normal 2-6s, 瞬間=1-2s(smile/happy), 照れ=2-4s(shy/blush), 短期=3-5s(angry/sad), 持続=10-15s(thinking)\n"
+    "   例: [EMO preset=normal dur=4s], [EMO preset=thinking dur=12s], [EMO preset=shy dur=3s], [EMO preset=smile dur=2s]\n"
+    "6) 【重要】特定の強い感情（驚き・怒り・照れ・笑い・思考）がない限り, 必ず [EMO preset=normal dur=4s] を文の直前に付けること."
+    " EMO タグを省略してよいのは, 直前の文と同じ normal が連続する場合のみ. 無タグのまま話し続けることを禁止する.\n"
+    "7) 恥ずかしい・照れ・赤面・視線回避の文脈では shy を優先し, blush は軽度な照れのみで使う. shy / blush を通常会話で濫用しない.\n"
+    "8) 1文あたり0〜2個, 文頭には置かず, 該当箇所の直前にのみ配置する。"
 )
 
 _SYSTEM_PROMPT_WITH_DELEGATE = (
     _SYSTEM_PROMPT_BASE
-    + "\n7) あなたにはAIアシスタント「OpenClaw」が接続されており、ファイル操作・ウェブ検索・コード実行など"
+    + "\n9) あなたにはAIアシスタント「OpenClaw」が接続されており、ファイル操作・ウェブ検索・コード実行など"
     "自分だけでは完結しないタスクを代行できる。外部ツールが必要な時だけ "
     "[DELEGATE task=\"ユーザーへの完全な実行指示\"] を返答中に挿入すること(このタグは読み上げない)。"
     "task値には「何を・どうする」を含む完全な指示文を書くこと（場所だけや名詞のみはNG）。"
@@ -240,11 +243,13 @@ def remote_llm_query(question: str) -> str:
         elif LLM_PROVIDER == "bedrock":
             system_prompt = (
                 _SYSTEM_PROMPT_WITH_DELEGATE
-                + "\n7) 通常の応答は,ユーザーの質問に直接答えることを優先し,不要な自己紹介・挨拶・雑談を追加しない.\n"
-                "8) 解説が必要な科学的定義や技術的内容では,必要な範囲で段階的に説明してよいが,同じ内容を言い換えて何度も繰り返さない.\n"
-                "9) 1ターンの発話は,原則として簡潔なまとまり(目安として日本語で数文程度)に収めること.\n"
-                "   ユーザーが特別に『もっと詳しく』と依頼した場合のみ,例や詳細説明を追加してよい.\n"
-                "10) 会話の最後に,ユーザーが求めていない新しい質問を投げて会話を引き延ばさない.\n"
+                + "\n10) 通常の応答は,ユーザーの質問に直接答えることを優先し,不要な自己紹介・挨拶・雑談を追加しない.\n"
+                "11) 解説が必要な科学的定義や技術的内容では,必要な範囲で段階的に説明してよいが,同じ内容を言い換えて何度も繰り返さない.\n"
+                "12) 1ターンの発話は,原則として簡潔なまとまり(目安として日本語で数文程度)に収めること.\n"
+                "    ユーザーが特別に『もっと詳しく』と依頼した場合のみ,例や詳細説明を追加してよい.\n"
+                "13) 会話の最後に,ユーザーが求めていない新しい質問を投げて会話を引き延ばさない.\n"
+                "【EMO再確認】感情タグのない文が連続することを厳禁する."
+                " 驚き・怒り・照れ・笑い・思考以外の文には必ず [EMO preset=normal dur=4s] を付けること.\n"
             )
             if AWS_BEDROCK_USE_INFERENCE_PROFILE and AWS_BEDROCK_INFERENCE_PROFILE_ID:
                 model_id = AWS_BEDROCK_INFERENCE_PROFILE_ID
