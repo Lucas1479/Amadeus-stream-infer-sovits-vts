@@ -17,6 +17,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 import traceback
 
@@ -119,7 +120,7 @@ def get_sovits_params(text: str, is_first_sentence: bool = False):
             "top_k": 5,
             "top_p": 1,
             "temperature": 0.6,
-            "sample_steps": 8,
+            "sample_steps": 4,
             "if_sr": False,
             "how_to_cut": "不切",
             "speed": 1.1,
@@ -296,6 +297,38 @@ async def speak_stream(text):
     logger.info(f"流式处理完成，总用时: {time.time() - overall_start:.2f}s")
 
 
+_FIRST_SENTENCE_STREAM_MIN_CHUNK_SEC = 0.35
+_FIRST_SENTENCE_STREAM_MAX_CHUNK_SEC = 0.80
+_FIRST_SENTENCE_STREAM_TARGET_CHUNKS = 3
+
+
+def _compute_first_sentence_stream_chunk_seconds(text: str, params: dict) -> float:
+    """按首句长度估算一个更稳的 chunk 时长，目标约 3 段，避免切得过碎。"""
+    stripped = (text or "").strip()
+    length = len(stripped)
+    speed = float(params.get("speed", 1.0) or 1.0)
+
+    # 这里不用 max_sec_override，它对首句有 3.5s 下限，会让极短句估计严重失真。
+    estimated_sec = max(0.9, min(3.0, (length * 0.11 + 0.25) / max(speed, 0.6)))
+    estimated_sec = max(0.9, min(3.0, (length * 0.11 + 0.25) / max(speed, 0.6)))
+    if length <= 8:
+        return 0.40
+    target_chunks = 2.5 if length <= 16 else float(_FIRST_SENTENCE_STREAM_TARGET_CHUNKS)
+    chunk_sec = estimated_sec / target_chunks
+    return max(
+        _FIRST_SENTENCE_STREAM_MIN_CHUNK_SEC,
+        min(_FIRST_SENTENCE_STREAM_MAX_CHUNK_SEC, chunk_sec),
+    )
+
+
+_PUNCT_ONLY_CHARS = set(" \t\r\n.,!?;:。！？、，…~～-—_・\"'`()[]{}<>《》〈〉「」『』【】")
+
+
+def _is_punctuation_only_sentence(text: str) -> bool:
+    stripped = (text or "").strip()
+    return bool(stripped) and all(ch in _PUNCT_ONLY_CHARS for ch in stripped)
+
+
 async def speak_stream_graph_serial(text, sentence_id, is_first_sentence=False):
     """Graph 模式专用：全局锁确保串行推理，合成完即释放锁让下一句并行合成。"""
     global graph_tts_lock
@@ -317,12 +350,27 @@ async def speak_stream_graph_serial(text, sentence_id, is_first_sentence=False):
         graph_tts_lock.release()
 
     try:
+        first_sentence_chunk_seconds = None
+        if is_first_sentence:
+            first_sentence_chunk_seconds = _compute_first_sentence_stream_chunk_seconds(
+                text, get_sovits_params(text, True)
+            )
+            logger.info(
+                f"[S1流式] 自适应 chunk 时长: {first_sentence_chunk_seconds:.2f}s "
+                f"(目标 {_FIRST_SENTENCE_STREAM_TARGET_CHUNKS} 段)"
+            )
+
         await speak_stream_enhanced_asyncio_queue(
             text,
             sentence_id,
             is_first_sentence=is_first_sentence,
             force_graph=True,
             on_synthesis_done=_release_lock,
+            chunk_size_seconds=(
+                first_sentence_chunk_seconds if is_first_sentence else None
+            ),
+            # 仅句1走流式首发声；句2+ 维持原有稳定链路。
+            stream_to_player=is_first_sentence,
         )
     finally:
         _release_lock()  # 兜底：异常时也确保锁被释放
@@ -413,31 +461,31 @@ async def speak_stream_enhanced(text, sentence_id, is_first_sentence=False, chun
 
 async def speak_stream_enhanced_asyncio_queue(
     text, sentence_id, is_first_sentence=False, *, force_graph: bool = False,
-    on_synthesis_done=None,
+    on_synthesis_done=None, stream_to_player: bool = False,
+    chunk_size_seconds: float = None,
 ):
-    """新版生产者：合成一句完整的音频，然后提交给 PlaybackManager。"""
+    """增强版异步队列 TTS，支持首句流式播放和 Graph 串行释放。"""
     try:
         _sha = _compute_text_sha1(text)
     except Exception:
         _sha = "sha_err"
     logger.info(
         f"[TTS-FUNC-ENTER] func=speak_stream_enhanced_asyncio_queue "
-        f"id={sentence_id} sha1={_sha} first={is_first_sentence}"
+        f"id={sentence_id} sha1={_sha} first={is_first_sentence} stream={stream_to_player}"
     )
 
     if _tts_inferencer is None:
-        logger.error("TTS推理器未初始化，无法合成语音")
+        logger.error("TTS推理器未初始化，无法生成语音")
         return
 
     def tts_producer(loop, queue, producer_text, producer_params):
-        """在后台线程中运行的 TTS 生产者。"""
         try:
             logger.info(f"[后台线程] TTS生产者线程已启动: {sentence_id}")
             for item in _tts_inferencer.infer_stream(text=producer_text, **producer_params):
                 loop.call_soon_threadsafe(queue.put_nowait, item)
             logger.info(f"[后台线程] TTS生产者线程正常完成: {sentence_id}")
         except Exception as e:
-            logger.error(f"[后台线程] TTS生产者线程出错 ({sentence_id}): {e}")
+            logger.error(f"[后台线程] TTS生产者线程异常({sentence_id}): {e}")
             logger.error(f"--- 后台线程详细Traceback ---\n{traceback.format_exc()}")
             loop.call_soon_threadsafe(queue.put_nowait, ("__ERROR__", e))
         finally:
@@ -450,31 +498,20 @@ async def speak_stream_enhanced_asyncio_queue(
         params["enable_cuda_graph"] = True
         params["enable_static_kv"] = True
         logger.info(f"[Graph Serial] 强制启用CUDA Graph参数: sentence_id={sentence_id}")
-    params['ref_audio_path'] = _REF_AUDIO
-    params['prompt_text'] = _REF_TEXT
+    params["ref_audio_path"] = _REF_AUDIO
+    params["prompt_text"] = _REF_TEXT
     processed_text = correct_pronunciation_for_tts(text)
+
+    producer_chunk_size_seconds = (
+        chunk_size_seconds if (stream_to_player and is_first_sentence) else None
+    )
+    params["chunk_size_seconds"] = producer_chunk_size_seconds
 
     loop.run_in_executor(_tts_executor, tts_producer, loop, queue, processed_text, params)
     logger.info(f"[监控] TTS生产者任务已提交到后台线程: {sentence_id}")
 
-    audio_chunks = []
-    while True:
-        item = await queue.get()
-        if isinstance(item, tuple) and isinstance(item[0], str) and item[0].startswith("__"):
-            signal, data = item
-            if signal == "__DONE__":
-                break
-            if signal == "__ERROR__":
-                logger.error(f"主线程收到来自后台的错误信号: {data}")
-                return
-        sr, audio_chunk, text_item = item
-        if audio_chunk is not None and len(audio_chunk) > 0:
-            audio_chunks.append(audio_chunk)
-            if len(audio_chunks) == 1:
-                logger.info(f"[TTS-CHUNK] 首个音频块生成: {sentence_id} ({len(audio_chunk)} samples)")
-
-    # 合成完成后立即释放锁/信号量，不等待播放，让下一句可以立刻开始合成
     _released = False
+
     def _release_now():
         nonlocal _released
         if _released:
@@ -484,35 +521,82 @@ async def speak_stream_enhanced_asyncio_queue(
             on_synthesis_done()
         if _exp_tts_semaphore is not None:
             _exp_tts_semaphore.release()
-            logger.debug(f"[Semaphore] 合成完成，释放信号量: {sentence_id}")
+            logger.debug(f"[Semaphore] 释放实验性TTS信号量: {sentence_id}")
+
+    if stream_to_player and _playback_manager is not None:
+        s1_queue: asyncio.Queue = asyncio.Queue()
+        asyncio.create_task(
+            _playback_manager.play_s1_stream(s1_queue, sentence_id, text)
+        )
+
+        chunk_count = 0
+        try:
+            while True:
+                item = await queue.get()
+                if isinstance(item, tuple) and isinstance(item[0], str) and item[0].startswith("__"):
+                    signal, data = item
+                    if signal == "__DONE__":
+                        break
+                    if signal == "__ERROR__":
+                        logger.error(f"[S1流式] 后台线程返回错误: {data}")
+                        await s1_queue.put(None)
+                        return
+
+                sr, audio_chunk, text_item = item
+                if audio_chunk is not None and len(audio_chunk) > 0:
+                    chunk_count += 1
+                    if chunk_count == 1:
+                        logger.info(
+                            f"[TTS-CHUNK] 首个音频块生成（S1流式）: "
+                            f"{sentence_id} ({len(audio_chunk)} samples)"
+                        )
+                    await s1_queue.put(audio_chunk)
+
+            _release_now()
+            logger.info(f"[S1流式] 推理完成，锁已释放，播放继续: {sentence_id}")
+            await s1_queue.put(None)
+        except Exception as e:
+            logger.error(f"[S1流式] 播放链异常: {sentence_id} {e}\n{traceback.format_exc()}")
+            await s1_queue.put(None)
+        finally:
+            _release_now()
+        return
+
+    audio_chunks = []
+    while True:
+        item = await queue.get()
+        if isinstance(item, tuple) and isinstance(item[0], str) and item[0].startswith("__"):
+            signal, data = item
+            if signal == "__DONE__":
+                break
+            if signal == "__ERROR__":
+                logger.error(f"[后台线程] 后台线程返回错误: {data}")
+                return
+        sr, audio_chunk, text_item = item
+        if audio_chunk is not None and len(audio_chunk) > 0:
+            audio_chunks.append(audio_chunk)
+            if len(audio_chunks) == 1:
+                logger.info(f"[TTS-CHUNK] 首个音频块生成: {sentence_id} ({len(audio_chunk)} samples)")
 
     try:
         if audio_chunks and _playback_manager is not None:
             full_audio_data = np.concatenate(audio_chunks)
             logger.info(f"[监控] TTS合成完成，准备提交播放列表: {sentence_id}")
             sentence_seq = _parse_sentence_seq(sentence_id)
-            _release_now()  # 合成已完成，立即释放，让下一句开始合成
-            if USE_FIRST_SENTENCE_SPRINT:
-                if sentence_seq == 2:
-                    logger.info("[串音修复] 第二句合成完成，等待第一句播放完成后再播放")
-                    await _playback_manager.player_is_ready.wait()
-                    logger.info("[串音修复] 第一句播放完成，第二句开始播放")
-            else:
-                if sentence_seq == 2:
-                    logger.info("[串音修复] 批量模式：第二句等待第一句")
-                    await _playback_manager.player_is_ready.wait()
-                    logger.info("[串音修复] 第一句播放完成，第二句开始播放")
+            _release_now()
+            if sentence_seq == 2:
+                logger.info("[串音修复] 第二句合成完成，等待第一句播放完成后再播放")
+                await _playback_manager.player_is_ready.wait()
+                logger.info("[串音修复] 第一句播放完成，第二句开始播放")
             await _playback_manager.add_to_playlist(full_audio_data, sentence_id, text)
         else:
-            logger.warning(f"TTS任务未生成任何音频数据: {sentence_id}")
+            logger.warning(f"TTS未生成有效音频数据: {sentence_id}")
     finally:
-        _release_now()  # 兜底：异常或空音频时也确保释放
-
+        _release_now()
 
 # =============================================================================
 # 句子调度工作线程
 # =============================================================================
-
 async def play_sentence_worker():
     """从 pending_sentence_items 队列取出句子，创建对应 TTS 合成任务。
 
@@ -535,6 +619,14 @@ async def play_sentence_worker():
             cnt = play_sentence_worker._intent_counts.get(sentence_id, 0) + 1
             play_sentence_worker._intent_counts[sentence_id] = cnt
             logger.info(f"[TTS-START-INTENT] id={sentence_id} sha1={_sha} first={is_first} intent_count={cnt}")
+
+            if _is_punctuation_only_sentence(sentence):
+                logger.info(f"[TTS-SKIP] 纯标点句跳过TTS，改用极短静音占位: {sentence_id} text={sentence!r}")
+                if _playback_manager is not None:
+                    placeholder_audio = np.zeros(960, dtype=np.float32)  # 约 40ms @ 24kHz
+                    await _playback_manager.add_to_playlist(placeholder_audio, sentence_id, "")
+                _pending_sentence_items.task_done()
+                continue
 
             graph_enabled = os.environ.get('ENABLE_CUDA_GRAPH', '0') == '1'
             if graph_enabled:
@@ -611,6 +703,57 @@ async def warmup_graph_pipeline():
                 params.get("max_sec_override"),
             )
             logger.info(f"[Graph Warmup] 本地 TTS 预热完成，用时 {time.time() - start_t:.2f}s（音频已丢弃）")
+
+            stream_warmup_text = (
+                "これは流式音声の事前準備です。"
+                "最初の応答を安定させるために短く温めます。"
+            )
+            stream_params = get_sovits_params(stream_warmup_text, is_first_sentence=True)
+            stream_params['ref_audio_path'] = _REF_AUDIO
+            stream_params['prompt_text'] = _REF_TEXT
+
+            def _stream_warmup_consume(chunk_seconds: float):
+                consumed = 0
+                for sr, audio_chunk, text_item in _tts_inferencer.infer_stream(
+                    text=stream_warmup_text,
+                    ref_audio_path=stream_params['ref_audio_path'],
+                    prompt_text=stream_params['prompt_text'],
+                    text_language=stream_params["text_language"],
+                    prompt_language=stream_params["prompt_language"],
+                    how_to_cut=stream_params["how_to_cut"],
+                    top_k=stream_params.get("top_k", 20),
+                    top_p=stream_params["top_p"],
+                    temperature=stream_params["temperature"],
+                    speed=stream_params["speed"],
+                    sample_steps=stream_params["sample_steps"],
+                    ref_free=stream_params.get("ref_free", False),
+                    pause_second=stream_params["pause_second"],
+                    if_freeze=stream_params.get("if_freeze", False),
+                    inp_refs=None,
+                    if_sr=stream_params.get("if_sr", False),
+                    enable_cuda_graph=True,
+                    enable_static_kv=True,
+                    chunk_size_seconds=chunk_seconds,
+                    max_sec_override=stream_params.get("max_sec_override"),
+                ):
+                    if audio_chunk is None or len(audio_chunk) == 0:
+                        continue
+                    consumed += 1
+                    if consumed >= 2:
+                        break
+                return consumed
+
+            stream_chunk_variants = (0.35, 0.45, 0.60, 0.75)
+            for stream_chunk_seconds in stream_chunk_variants:
+                logger.info(
+                    f"[Graph Warmup] 开始首句流式预热（chunk={stream_chunk_seconds:.2f}s）..."
+                )
+                start_stream_t = time.time()
+                consumed = await asyncio.to_thread(_stream_warmup_consume, stream_chunk_seconds)
+                logger.info(
+                    f"[Graph Warmup] 首句流式预热完成，用时 {time.time() - start_stream_t:.2f}s，"
+                    f"已预热 {consumed} 个 chunk"
+                )
         except Exception as e:
             logger.warning(f"[Graph Warmup] TTS 预热失败: {e}")
 

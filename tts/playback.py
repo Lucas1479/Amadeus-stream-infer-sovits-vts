@@ -229,6 +229,128 @@ class PlaybackManager:
         """标记本轮最后一句 ID；该句播完后触发 on_turn_playback_complete。"""
         self._turn_last_sentence_id = sentence_id
 
+    async def play_s1_stream(
+        self,
+        chunk_queue: asyncio.Queue,
+        sentence_id: str,
+        japanese_text: str,
+    ) -> None:
+        """句1专用流式播放：从 chunk_queue 串行消费 chunk 并立即播放。
+
+        chunk_queue 协议：
+          - 元素为 np.ndarray（float32 音频数据）
+          - put(None) 表示 EOF，收到后停止播放并置位 player_is_ready
+
+        设计要点：
+          - 每个 chunk 用 run_in_executor 同步写 pyaudio，await 保证串行，
+            不存在多线程同时写同一 stream 的问题
+          - player_is_ready 仅在 finally 中置位一次，与 PlaybackManager.run()
+            的句2+ 路径契约完全相同
+          - next_seq_to_play 在此处更新为 2 并通知 play_condition，确保
+            PlaybackManager.run() 能在 pending_audio 里等到正确序号
+        """
+        # ── 等前一轮播完，占用播放器 ─────────────────────────────────────
+        await self.player_is_ready.wait()
+        self.player_is_ready.clear()
+        self.current_playing_id = sentence_id
+        self.logger.info(f"🎵 [S1流式] 开始流式播放: {sentence_id}")
+
+        # ── 触发 on_sentence_start 回调（表情切换等） ────────────────────
+        if self.on_sentence_start is not None:
+            try:
+                self.on_sentence_start(sentence_id)
+            except Exception as _e:
+                self.logger.warning(f"on_sentence_start 回调异常: {_e}")
+
+        # ── 通知 PlaybackManager.run() 下一个期望序号为 2 ─────────────────
+        self.next_seq_to_play = 2
+        async with self.play_condition:
+            self.play_condition.notify()
+        self.logger.info("🔄 [S1流式] next_seq_to_play 已更新为 2")
+
+        # ── 字幕 / 预翻译 ──────────────────────────────────────────────────
+        hooks = self.player._hooks
+        if hooks.subtitle_available and hooks.update_subtitle_display:
+            hooks.update_subtitle_display(japanese_text, "")
+        if hooks.check_and_display_pre_translation:
+            asyncio.create_task(
+                hooks.check_and_display_pre_translation(sentence_id, japanese_text)
+            )
+
+        # ── 初始化 pyaudio stream ──────────────────────────────────────────
+        sample_rate = 24000
+        self.player.initialize(sample_rate)
+        player = self.player
+        player.vts_manager.send_mouth_data(0.0)
+        player.last_send_time = time.time()
+        loop = asyncio.get_running_loop()
+        first_chunk_played = False
+
+        # ── 串行播放所有 chunk ─────────────────────────────────────────────
+        try:
+            while True:
+                audio_chunk = await chunk_queue.get()
+                if audio_chunk is None:
+                    # EOF 哨兵：所有 chunk 已发送完毕
+                    break
+
+                # 确保 float32
+                if audio_chunk.dtype != np.float32:
+                    audio_chunk = audio_chunk.astype(np.float32)
+
+                if not first_chunk_played:
+                    first_chunk_played = True
+                    self.logger.info(
+                        f"[PLAYBACK-S1流式] 首个chunk开始物理播放: {sentence_id} "
+                        f"({len(audio_chunk)} samples)"
+                    )
+
+                # 捕获当前 chunk 的引用（避免闭包捕获循环变量）
+                _chunk = audio_chunk
+
+                def _sync_play(chunk=_chunk):
+                    for i in range(0, len(chunk), player.chunk_size):
+                        c = chunk[i : i + player.chunk_size]
+                        if not len(c):
+                            break
+                        player.stream.write(c.tobytes())
+                        t = time.time()
+                        if t - player.last_send_time >= player.send_interval:
+                            rms = float(np.sqrt(np.mean(c ** 2)))
+                            player.vts_manager.send_mouth_data(
+                                min(1.0, rms * player.volume_multiplier)
+                            )
+                            player.last_send_time = t
+
+                # await 保证当前 chunk 物理写完才取下一个（串行）
+                await loop.run_in_executor(None, _sync_play)
+                self.logger.debug(
+                    f"[S1流式] chunk 播放完成: {len(audio_chunk)} samples"
+                )
+
+            player.vts_manager.send_mouth_data(0.0)
+            self.logger.info(f"✅ [S1流式] 全部音频播放完毕: {sentence_id}")
+
+        except Exception as e:
+            self.logger.error(f"❌ [S1流式] 播放出错: {e}", exc_info=True)
+
+        finally:
+            player.vts_manager.send_mouth_data(0.0)
+            # 留少量时间让声卡硬件缓冲排空（stream.write 已阻塞，只差最后一帧）
+            await asyncio.sleep(0.08)
+
+            # ── 本轮最后一句回调 ──────────────────────────────────────────
+            if sentence_id == self._turn_last_sentence_id:
+                self._turn_last_sentence_id = None
+                if self.on_turn_playback_complete is not None:
+                    try:
+                        self.on_turn_playback_complete()
+                    except Exception as _e:
+                        self.logger.warning(f"on_turn_playback_complete 回调异常: {_e}")
+
+            self.player_is_ready.set()
+            self.logger.info(f"🟢 [S1流式] player_is_ready 已置位: {sentence_id}")
+
     async def run(self) -> None:
         """播放主循环，按句子序号顺序消费 pending_audio。"""
         self.logger.info("🎬 [监控] 播放管理器 'run' 循环已启动，等待播放任务...")
@@ -287,6 +409,28 @@ class PlaybackManager:
                         self.player_is_ready,
                     )
                 )
+
+                # 若当前句是本轮最后一句，创建独立监听任务：
+                # 主循环在最后一句结束后会卡在 play_condition.wait() 等新音频，
+                # 导致 on_turn_playback_complete 永远不被触发。
+                # 这里额外用一个 task 等待 player_is_ready，确保回调一定触发。
+                if sentence_id == self._turn_last_sentence_id:
+                    _watched_id = sentence_id
+
+                    async def _fire_on_last_done(watched=_watched_id):
+                        await self.player_is_ready.wait()
+                        if self._turn_last_sentence_id != watched:
+                            return  # 主循环已先触发，避免重复
+                        self._turn_last_sentence_id = None
+                        if self.on_turn_playback_complete is not None:
+                            try:
+                                self.on_turn_playback_complete()
+                            except Exception as _cb_err:
+                                self.logger.warning(
+                                    f"on_turn_playback_complete(watcher) 回调异常: {_cb_err}"
+                                )
+
+                    asyncio.create_task(_fire_on_last_done())
 
             except Exception as e:
                 self.logger.error(f"❌ PlaybackManager 'run' 循环出错: {e}", exc_info=True)
@@ -436,18 +580,17 @@ class StreamPlayerWithBuffer(StreamPlayer):
             self.logger.error(f"❌ 流式播放音频块出错: {e}", exc_info=True)
         finally:
             if is_last_chunk:
-                audio_duration = len(audio_chunk) / 24000
-                await asyncio.sleep(audio_duration + 0.05)
+                # stream.write() 是阻塞调用，run_in_executor 返回时音频数据已全部
+                # 送入 OS 声卡驱动缓冲区，只需预留极短的硬件缓冲余量即可。
+                # 原来的 asyncio.sleep(audio_duration + 0.05) 会在物理播放结束后
+                # 再额外等待整个句子的时长，造成句间静音间隙，已删除。
+                await asyncio.sleep(0.08)
                 completion_event.set()
+                audio_duration = len(audio_chunk) / 24000
                 self.logger.info(
                     f"🟢 [流式播放] 第一句播放完成，为 '{sentence_id}' 设置了完成信号。"
+                    f"（音频时长 {audio_duration:.3f}s）"
                 )
-                self.logger.info(
-                    f"🔍 [调试] 音频时长: {audio_duration:.3f}s, "
-                    f"player_is_ready状态: {completion_event.is_set()}"
-                )
-                self.logger.info("🎵 [优化策略] 第一句播放完成，第二句可以立即开始播放")
-                self.logger.info("🔄 [流式播放] 第一句播放完成，序号更新由PlaybackManager处理")
 
     def set_subtitle_content(self, japanese_text: str, chinese_text: str) -> None:
         self.current_sentence = japanese_text
