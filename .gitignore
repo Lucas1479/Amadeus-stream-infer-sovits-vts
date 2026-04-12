@@ -66,6 +66,7 @@ ffprobe
 # ── IDE / OS ────────────────────────────────────────────────────────────────
 .idea/
 .vscode/
+.claude/
 .DS_Store
 Thumbs.db
 
@@ -101,3 +102,10 @@ coverage.xml
 *.swp
 *.swo
 pip-log.txt
+
+# ── 渲染角色资源（体积大，仅本地；不入库）────────────────────────────────────
+render/assets/models/
+render/assets/Anime/
+render/assets/shy_seedance_manual_v7/
+render/assets/shy_*/
+render/assets/images/*/
