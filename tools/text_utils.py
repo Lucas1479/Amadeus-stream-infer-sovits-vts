@@ -29,7 +29,8 @@ from threading import Thread
 
 # 匹配 VTS / OpenClaw 控制标签，例如 [EXPR name=smile] [DELEGATE task="..."]
 TAG_LABEL_PATTERN = re.compile(
-    r"\[(PARAM|EXPR|HOTKEY|EMO|ANIM|DELEGATE)([^\]]*)\]"
+    r"\[(PARAM|EXPR|HOTKEY|EMO|ANIM|DELEGATE)([^\]]*)\]",
+    flags=re.IGNORECASE,
 )
 
 # ---------------------------------------------------------------------------
@@ -130,7 +131,7 @@ def parse_tags_and_clean(text: str):
         return text, actions
 
     def repl(match: re.Match) -> str:
-        tag_type  = match.group(1)
+        tag_type  = match.group(1).upper()
         attr_text = match.group(2) or ""
         if tag_type == "DELEGATE":
             # task 值可能含空格，优先匹配引号内容
