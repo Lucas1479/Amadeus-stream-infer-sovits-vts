@@ -7,7 +7,8 @@
     "fade_out_sec": "淡出时间（秒）",
     "transition_overlap_sec": "与下一个表情的交叉淡化重叠时间（秒），0 = 先淡出再淡入",
     "auto_return_to_idle": "是否在 idle_return_delay_sec 后自动回 idle（false = 持续到下一个 EMO 或新轮次）",
-    "idle_return_delay_sec": "auto_return_to_idle=true 时，从触发到开始淡出的等待秒数"
+    "idle_return_delay_sec": "auto_return_to_idle=true 时，从触发到开始淡出的等待秒数",
+    "sprite_clip": "Sprite 三段式配置：{ frameIntervalMs, loopMode, testPreviewSec }"
   },
   "thinking": {
     "expressions": [
@@ -18,7 +19,12 @@
     "fade_out_sec": 0.7,
     "transition_overlap_sec": 0.25,
     "auto_return_to_idle": true,
-    "idle_return_delay_sec": 11.5
+    "idle_return_delay_sec": 11.5,
+    "sprite_clip": {
+      "frameIntervalMs": 50,
+      "loopMode": "loop_until_speaking_end",
+      "testPreviewSec": 2.0
+    }
   },
   "smile": {
     "expressions": [
@@ -29,7 +35,12 @@
     "fade_out_sec": 0.25,
     "transition_overlap_sec": 0.2,
     "auto_return_to_idle": true,
-    "idle_return_delay_sec": 4.0
+    "idle_return_delay_sec": 4.0,
+    "sprite_clip": {
+      "frameIntervalMs": 50,
+      "loopMode": "loop_until_speaking_end",
+      "testPreviewSec": 2.0
+    }
   },
   "happy": {
     "expressions": [
@@ -40,7 +51,12 @@
     "fade_out_sec": 0.4,
     "transition_overlap_sec": 0.2,
     "auto_return_to_idle": true,
-    "idle_return_delay_sec": 10.0
+    "idle_return_delay_sec": 10.0,
+    "sprite_clip": {
+      "frameIntervalMs": 50,
+      "loopMode": "loop_until_speaking_end",
+      "testPreviewSec": 3.0
+    }
   },
   "angry": {
     "expressions": [
@@ -51,7 +67,12 @@
     "fade_out_sec": 0.5,
     "transition_overlap_sec": 0.1,
     "auto_return_to_idle": true,
-    "idle_return_delay_sec": 3.0
+    "idle_return_delay_sec": 3.0,
+    "sprite_clip": {
+      "frameIntervalMs": 50,
+      "loopMode": "loop_until_speaking_end",
+      "testPreviewSec": 2.0
+    }
   },
   "disappointed": {
     "expressions": [
@@ -62,7 +83,12 @@
     "fade_out_sec": 0.5,
     "transition_overlap_sec": 0.2,
     "auto_return_to_idle": true,
-    "idle_return_delay_sec": 5.0
+    "idle_return_delay_sec": 5.0,
+    "sprite_clip": {
+      "frameIntervalMs": 50,
+      "loopMode": "loop_until_speaking_end",
+      "testPreviewSec": 4.0
+    }
   },
   "surprised": {
     "expressions": [],
@@ -84,7 +110,12 @@
     "fade_out_sec": 0.4,
     "transition_overlap_sec": 0.2,
     "auto_return_to_idle": false,
-    "idle_return_delay_sec": 0.0
+    "idle_return_delay_sec": 0.0,
+    "sprite_clip": {
+      "frameIntervalMs": 20,
+      "loopMode": "loop_until_speaking_end",
+      "testPreviewSec": 5.0
+    }
   },
   "sad": {
     "expressions": [],
@@ -93,7 +124,12 @@
     "fade_out_sec": 0.5,
     "transition_overlap_sec": 0.2,
     "auto_return_to_idle": true,
-    "idle_return_delay_sec": 6.0
+    "idle_return_delay_sec": 6.0,
+    "sprite_clip": {
+      "frameIntervalMs": 50,
+      "loopMode": "loop_until_speaking_end",
+      "testPreviewSec": 2.0
+    }
   },
   "blush": {
     "expressions": [],
@@ -102,7 +138,40 @@
     "fade_out_sec": 0.4,
     "transition_overlap_sec": 0.2,
     "auto_return_to_idle": true,
-    "idle_return_delay_sec": 4.0
+    "idle_return_delay_sec": 4.0,
+    "sprite_clip": {
+      "frameIntervalMs": 42,
+      "loopMode": "loop_until_speaking_end",
+      "testPreviewSec": 2.0
+    }
+  },
+  "shy": {
+    "expressions": [],
+    "params": {},
+    "fade_in_sec": 0.2,
+    "fade_out_sec": 0.4,
+    "transition_overlap_sec": 0.2,
+    "auto_return_to_idle": true,
+    "idle_return_delay_sec": 4.0,
+    "sprite_clip": {
+      "frameIntervalMs": 42,
+      "loopMode": "loop_until_speaking_end",
+      "testPreviewSec": 12.0
+    }
+  },
+  "working": {
+    "expressions": [],
+    "params": {},
+    "fade_in_sec": 0.15,
+    "fade_out_sec": 0.25,
+    "transition_overlap_sec": 0.1,
+    "auto_return_to_idle": false,
+    "idle_return_delay_sec": 0.0,
+    "sprite_clip": {
+      "frameIntervalMs": 42,
+      "loopMode": "loop_until_speaking_end",
+      "testPreviewSec": 12.0
+    }
   },
   "annoyed": {
     "expressions": [],
@@ -111,7 +180,12 @@
     "fade_out_sec": 0.4,
     "transition_overlap_sec": 0.1,
     "auto_return_to_idle": true,
-    "idle_return_delay_sec": 3.0
+    "idle_return_delay_sec": 3.0,
+    "sprite_clip": {
+      "frameIntervalMs": 50,
+      "loopMode": "loop_until_speaking_end",
+      "testPreviewSec": 2.0
+    }
   },
   "eyes_closed": {
     "expressions": [],
