@@ -13,15 +13,73 @@
 <body>
   <div id="canvas-container"></div>
 
-  <!-- PixiJS v7 -->
-  <script src="https://cdn.jsdelivr.net/npm/pixi.js@7/dist/pixi.min.js"></script>
-
   <!--
-    pixi-live2d-display (可选，需要 Live2D Cubism Core 授权)
-    取消注释以启用 Live2D 支持：
-    <script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display/dist/cubism4.min.js"></script>
-  -->
+    所有脚本必须按顺序加载：
+      1. pixi.js
+      2. live2dcubismcore（必须在 pixi-live2d-display 之前）
+      3. pixi-live2d-display cubism4 绑定
+      4. renderer.js（必须在以上全部就绪后执行）
 
-  <script src="renderer.js"></script>
+    优先本地 vendor/ 目录，失败后回退 CDN。
+    使用串行动态加载确保顺序，renderer.js 最后加载。
+  -->
+  <script>
+    (function () {
+      var SCRIPTS = [
+        {
+          local: '/render/web/vendor/pixi.min.js',
+          cdn:   'https://cdn.jsdelivr.net/npm/pixi.js@7/dist/pixi.min.js'
+        },
+        {
+          local: '/render/web/vendor/live2dcubismcore.min.js',
+          cdn:   'https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js'
+        },
+        {
+          local: '/render/web/vendor/pixi-live2d-display.cubism4.min.js',
+          cdn:   'https://cdn.jsdelivr.net/npm/pixi-live2d-display/dist/cubism4.min.js'
+        },
+        {
+          local: '/render/web/renderer.js',
+          cdn:   null   // renderer.js 没有 CDN 回退
+        }
+      ];
+
+      function loadOne(src, onDone) {
+        var s = document.createElement('script');
+        s.src = src;
+        s.onload  = function () { onDone(true); };
+        s.onerror = function () { onDone(false); };
+        document.head.appendChild(s);
+      }
+
+      function loadWithFallback(item, next) {
+        loadOne(item.local, function (ok) {
+          if (ok) {
+            next();
+          } else if (item.cdn) {
+            console.warn('[Loader] 本地加载失败，回退 CDN: ' + item.cdn);
+            loadOne(item.cdn, function (ok2) {
+              if (!ok2) {
+                console.error('[Loader] CDN 也加载失败，跳过: ' + item.cdn);
+              }
+              next();
+            });
+          } else {
+            console.error('[Loader] 加载失败且无 CDN 回退: ' + item.local);
+            next();
+          }
+        });
+      }
+
+      function loadAll(scripts, idx) {
+        if (idx >= scripts.length) return;
+        loadWithFallback(scripts[idx], function () {
+          loadAll(scripts, idx + 1);
+        });
+      }
+
+      loadAll(SCRIPTS, 0);
+    })();
+  </script>
 </body>
 </html>
